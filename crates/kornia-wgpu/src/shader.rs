@@ -1,4 +1,3 @@
-// src/shader.rs
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ShaderKind {
     ResizeNearest,

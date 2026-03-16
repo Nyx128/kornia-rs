@@ -1,4 +1,3 @@
-// src/ops/tensor/mod.rs
 pub mod elementwise;
 
 pub trait GpuElement: bytemuck::Pod + bytemuck::Zeroable + Copy + Send + Sync + 'static {
@@ -16,4 +15,3 @@ impl GpuElement for i32 {
     const WGSL_TYPE: &'static str = "i32";
 }
 
-// We'll add the generic tensor dispatcher here in the next step!

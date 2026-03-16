@@ -129,7 +129,7 @@ fn compute_tensor_elementwise(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: in_b.as_entire_binding(),
-            }, // For unary, we just bind buffer A twice!
+            }, // For unary, we just bind buffer A twice
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: out_buffer.as_entire_binding(),

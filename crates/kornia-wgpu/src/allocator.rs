@@ -9,7 +9,8 @@ use kornia_tensor::{allocator::TensorAllocatorError, TensorAllocator};
 #[derive(Clone, Debug)]
 pub struct WgpuAllocator {
     pub(crate) device: Arc<WgpuDevice>,
-    pub(crate) buffer: Arc<wgpu::Buffer>,
+    pub(crate) gpu_buffer: Arc<wgpu::Buffer>,
+    pub(crate) cpu_backing: Arc<Vec<u8>>
 }
 
 impl TensorAllocator for WgpuAllocator {

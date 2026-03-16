@@ -1,14 +1,12 @@
-// src/transfer.rs
 use crate::allocator::WgpuAllocator;
 use crate::device::WgpuDevice;
 use crate::error::WgpuError;
 use crate::pixel::GpuPixel;
 use crate::session::WgpuSession;
 use kornia_image::allocator::{CpuAllocator, ImageAllocator};
-use kornia_image::{Image, ImageSize}; // Adjust imports based on workspace
+use kornia_image::{Image, ImageSize};
 use kornia_tensor::storage::TensorStorage;
 use kornia_tensor::Tensor;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 pub(crate) fn wrap_gpu_buffer<T: GpuPixel, const C: usize>(
@@ -17,14 +15,24 @@ pub(crate) fn wrap_gpu_buffer<T: GpuPixel, const C: usize>(
     device: Arc<WgpuDevice>,
 ) -> Result<Image<T, C, WgpuAllocator>, WgpuError> {
     let numel = size.width * size.height * C;
+    let byte_size = numel * std::mem::size_of::<T>();
+
+    // Allocate zeroed CPU backing so TensorStorage::ptr is valid (never dangling)
+    let cpu_backing = Arc::new(vec![0u8; byte_size]);
+
     let alloc = WgpuAllocator {
         device,
-        buffer: Arc::new(buffer),
+        gpu_buffer: Arc::new(buffer),
+        cpu_backing: cpu_backing.clone(),
     };
 
-    // SAFETY: ptr is NonNull::dangling() and is never dereferenced.
+    // Get a real pointer into cpu_backing — safe because Arc keeps it alive
+    let ptr = cpu_backing.as_ptr() as *const T;
+
+    // This unsafe block is now locally sound: ptr is valid for numel elements
+    // and cpu_backing in alloc keeps it alive for the lifetime of the Image.
     unsafe {
-        Image::from_raw_parts(size, NonNull::dangling().as_ptr(), numel, alloc)
+        Image::from_raw_parts(size, ptr, numel, alloc)
             .map_err(|e| WgpuError::ImageError(e.to_string()))
     }
 }
@@ -90,7 +98,7 @@ where
     });
 
     encoder.copy_buffer_to_buffer(
-        &gpu_image.storage.alloc().buffer,
+        &gpu_image.storage.alloc().gpu_buffer,
         0,
         &staging_buffer,
         0,
@@ -136,7 +144,7 @@ where
 pub(crate) fn src_buffer<T, const C: usize>(
     img: &kornia_image::Image<T, C, WgpuAllocator>,
 ) -> &wgpu::Buffer {
-    &img.storage.alloc().buffer
+    &img.storage.alloc().gpu_buffer
 }
 
 /// Extracts the raw wgpu::Buffer reference from a GPU Tensor
@@ -145,7 +153,7 @@ pub(crate) fn src_buffer_tensor<T, const N: usize>(
 ) -> &wgpu::Buffer {
     // We use the `.alloc()` getter provided by TensorStorage
     // Assuming your WgpuAllocator struct has a public field named `buffer`
-    &tensor.storage.alloc().buffer
+    &tensor.storage.alloc().gpu_buffer
 }
 
 /// Wraps a newly computed wgpu::Buffer into a full Kornia Tensor
@@ -153,31 +161,25 @@ pub(crate) fn wrap_gpu_tensor<T, const N: usize>(
     shape: [usize; N],
     strides: [usize; N],
     buffer: wgpu::Buffer,
-    device_arc: Arc<WgpuDevice>, // or however your device arc is typed
+    device: Arc<WgpuDevice>,
 ) -> Result<Tensor<T, N, WgpuAllocator>, WgpuError> {
-    let buffer_arc = Arc::new(buffer);
     let numel = shape.iter().product::<usize>();
-
     let byte_size = numel * std::mem::size_of::<T>();
 
-    // 2. Instantiate your WgpuAllocator around the buffer
-    // (Again, mirror your exact WgpuAllocator initialization from Image ops)
+    let cpu_backing = Arc::new(vec![0u8; byte_size]);
+
     let allocator = WgpuAllocator {
-        device: device_arc,
-        buffer: buffer_arc,
+        device,
+        gpu_buffer: Arc::new(buffer),
+        cpu_backing: cpu_backing.clone(),
     };
 
-    let dangling_ptr = std::ptr::NonNull::<T>::dangling().as_ptr();
+    let ptr = cpu_backing.as_ptr() as *const T;
 
-    // Use the public constructor!
-    let storage = unsafe { TensorStorage::from_raw_parts(dangling_ptr, byte_size, allocator) };
+    // Locally sound for the same reason as wrap_gpu_buffer
+    let storage = unsafe { TensorStorage::from_raw_parts(ptr, byte_size, allocator) };
 
-    // 4. Return the fully formed Tensor!
-    Ok(Tensor {
-        storage,
-        shape,
-        strides,
-    })
+    Ok(Tensor { storage, shape, strides })
 }
 
 #[cfg(test)]

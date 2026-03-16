@@ -1,4 +1,3 @@
-// src/session.rs
 use crate::device::{DeviceOptions, WgpuDevice};
 use crate::error::WgpuError;
 use crate::ops::tensor::GpuElement;
@@ -149,9 +148,12 @@ mod tests {
             mapped_at_creation: false,
         });
 
+        let cpu_backing = Arc::new(vec![0u8; 4 as usize]);
+
         let alloc = WgpuAllocator {
             device: session.device.clone(),
-            buffer: std::sync::Arc::new(buffer),
+            gpu_buffer: std::sync::Arc::new(buffer),
+            cpu_backing,
         };
 
         let layout = Layout::from_size_align(4, 1).unwrap();

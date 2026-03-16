@@ -1,16 +1,14 @@
-// benches/resize_bench.rs
-
 use criterion::{criterion_group, criterion_main, Criterion};
 use kornia_image::{allocator::CpuAllocator, Image, ImageSize};
 use kornia_imgproc::interpolation::InterpolationMode;
 use kornia_imgproc::resize::resize_native;
-use kornia_wgpu::ops::resize::resize_bilinear_f32;
+use kornia_wgpu::ops::image::resize::resize_bilinear_f32;
 use kornia_wgpu::session::WgpuSession;
 use kornia_wgpu::transfer::{image_to_cpu, image_to_gpu};
 use std::hint::black_box;
 
 fn bench_resize(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Bilinear Resize (1080p to 720p)");
+    let mut group = c.benchmark_group("Bilinear Resize (2160p to 1080p)");
 
     // 1. Setup Data
     let session = pollster::block_on(WgpuSession::new()).expect("Failed to init wgpu");
@@ -19,23 +17,22 @@ fn bench_resize(c: &mut Criterion) {
         height: 2160,
     };
     let out_size = ImageSize {
-        width: 1280,
-        height: 720,
+        width: 1920,
+        height: 1080,
     };
 
     let cpu_data = vec![0.5f32; in_size.width * in_size.height];
     let cpu_image = Image::<f32, 1, _>::new(in_size, cpu_data, CpuAllocator).unwrap();
     let gpu_image = image_to_gpu(&session, &cpu_image).unwrap();
 
-    // 2. Warmup wgpu
+    //Warmup wgpu
     let _ = resize_bilinear_f32(&session, &gpu_image, out_size).unwrap();
     session
         .raw_device()
         .poll(wgpu::PollType::wait_indefinitely());
 
-    // ==========================================
+
     // GPU: Compute Only
-    // ==========================================
     group.bench_function("GPU Compute Only", |b| {
         b.iter(|| {
             let res = resize_bilinear_f32(&session, &gpu_image, out_size).unwrap();
@@ -46,9 +43,8 @@ fn bench_resize(c: &mut Criterion) {
         });
     });
 
-    // ==========================================
+
     // GPU: End-to-End (RAM -> VRAM -> Math -> RAM)
-    // ==========================================
     group.bench_function("GPU End-to-End", |b| {
         b.iter(|| {
             let gpu_in = image_to_gpu(&session, &cpu_image).unwrap();
@@ -61,9 +57,8 @@ fn bench_resize(c: &mut Criterion) {
         });
     });
 
-    // ==========================================
+
     // CPU: Kornia Baseline (resize_native)
-    // ==========================================
     // We pre-allocate the output buffer outside the iteration to
     // strictly measure the math, not the memory allocation!
     let mut cpu_out_image = Image::<f32, 1, _>::new(

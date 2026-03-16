@@ -1,4 +1,3 @@
-// src/device.rs
 use crate::error::WgpuError;
 use crate::shader::{PipelineKey, WgslShader};
 use std::collections::HashMap;

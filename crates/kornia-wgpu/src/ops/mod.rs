@@ -1,5 +1,5 @@
-pub mod resize;
 pub mod tensor;
+pub mod image;
 
 use crate::session::WgpuSession;
 use crate::shader::{PipelineKey, ShaderKind, WgslShader};
