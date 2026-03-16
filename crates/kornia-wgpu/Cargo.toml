@@ -1,0 +1,36 @@
+[package]
+name = "kornia-wgpu"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+description = "WGPU backend for kornia-rs"
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+include = { workspace = true }
+
+[dependencies]
+kornia-tensor = { workspace = true }
+kornia-image  = { workspace = true }
+kornia-imgproc = {workspace =true}
+wgpu     = { version = "28", features = ["wgsl"] }
+bytemuck = { version = "1",  features = ["derive"] }
+thiserror = { workspace = true }
+half = { version = "2", features = ["bytemuck"], optional = true }
+naga = { version = "28", optional = true }
+pollster = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+kornia-io = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+default          = []
+profiling        = []
+naga-validation  = ["dep:naga"]
+
+[[bench]]
+name = "resize_bench"
+harness = false

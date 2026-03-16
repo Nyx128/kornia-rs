@@ -1,0 +1,124 @@
+pub mod resize;
+pub mod tensor;
+
+use crate::session::WgpuSession;
+use crate::shader::{PipelineKey, ShaderKind, WgslShader};
+
+/// Helper to quickly allocate an output storage buffer for a GPU image
+pub(crate) fn create_storage_buffer(
+    device: &wgpu::Device,
+    byte_size: wgpu::BufferAddress,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Op Output Buffer"),
+        size: byte_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// A generic dispatcher for operations that take 1 input buffer and write to 1 output buffer.
+pub(crate) fn compute_1in_1out<I: bytemuck::Pod>(
+    session: &WgpuSession,
+    shader_id: ShaderKind,
+    shader_source: &'static str,
+    in_buffer: &wgpu::Buffer,
+    out_buffer: &wgpu::Buffer,
+    immediates: &I,
+    dispatch_size: (u32, u32), // usually the target image width and height
+    workgroup_size: (u8, u8),  // e.g., (16, 16)
+    pixel_bytes: u8,
+    channels: u8,
+) {
+    let device_arc = session.raw_device_arc();
+    let device = &device_arc.device;
+    let queue = &device_arc.queue;
+
+    // 1. Standard 2-buffer layout (Input Read-Only, Output Read-Write)
+    let bgl_entries = [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+    ];
+
+    // 2. Fetch or Compile Pipeline
+    let key = PipelineKey {
+        shader_id: shader_id.clone(),
+        pixel_bytes,
+        channels,
+        wg_x: workgroup_size.0,
+        wg_y: workgroup_size.1,
+        variant: 0,
+    };
+
+    let mut shader = WgslShader {
+        kind: shader_id,
+        source: shader_source.to_string(),
+    };
+    shader.build();
+
+    let pipeline = device_arc.get_or_create_pipeline(
+        key,
+        &shader,
+        std::mem::size_of::<I>() as u32,
+        &bgl_entries,
+    );
+
+    // 3. Create Bind Group
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("1in_1out Bind Group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: in_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    // 4. Encode and Dispatch
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.set_immediates(0, bytemuck::bytes_of(immediates));
+
+        // Automatically calculate grid size with ceiling division
+        let wg_x = (dispatch_size.0 + workgroup_size.0 as u32 - 1) / workgroup_size.0 as u32;
+        let wg_y = (dispatch_size.1 + workgroup_size.1 as u32 - 1) / workgroup_size.1 as u32;
+
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+
+    queue.submit(std::iter::once(encoder.finish()));
+}
