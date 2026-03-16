@@ -1,4 +1,5 @@
 use crate::error::WgpuError;
+use crate::shader::BindingRole;
 use crate::shader::{PipelineKey, WgslShader};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -84,7 +85,6 @@ impl WgpuDevice {
         key: PipelineKey,
         shader: &WgslShader,
         immediate_size: u32,
-        bgl_entries: &[wgpu::BindGroupLayoutEntry],
     ) -> Arc<wgpu::ComputePipeline> {
         // Fast path: Check the cache first
         {
@@ -102,11 +102,34 @@ impl WgpuDevice {
                 source: wgpu::ShaderSource::Wgsl(shader.source.as_str().into()),
             });
 
+        let bgl_entries: Vec<wgpu::BindGroupLayoutEntry> = shader
+            .kind
+            .bindings()
+            .iter()
+            .map(|b| wgpu::BindGroupLayoutEntry {
+                binding: b.slot,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: match b.role {
+                        BindingRole::ReadBuffer => {
+                            wgpu::BufferBindingType::Storage { read_only: true }
+                        }
+                        BindingRole::WriteBuffer => {
+                            wgpu::BufferBindingType::Storage { read_only: false }
+                        }
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("Compute BGL"),
-                    entries: bgl_entries,
+                    entries: &bgl_entries,
                 });
 
         let pipeline_layout = self

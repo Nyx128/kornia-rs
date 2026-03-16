@@ -50,7 +50,7 @@ where
     let numel = size.width * size.height * C;
     let byte_size = (numel * std::mem::size_of::<T>()) as wgpu::BufferAddress;
 
-    // 1. Create a storage buffer on the GPU
+    // Create a storage buffer on the GPU
     let buffer = session.raw_device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("GPU Image Buffer"),
         size: byte_size,
@@ -61,12 +61,12 @@ where
         mapped_at_creation: false,
     });
 
-    // 2. Write the data to the buffer
+    // Write the data to the buffer
     // bytemuck safely casts our strongly-typed pixel slice to raw bytes
     let byte_slice = bytemuck::cast_slice(cpu_image.as_slice());
     session.raw_queue().write_buffer(&buffer, 0, byte_slice);
 
-    // 3. Wrap the new buffer in our custom allocator
+    // Wrap the new buffer in our custom allocator
     wrap_gpu_buffer(size, buffer, session.device.clone())
 }
 
@@ -84,7 +84,7 @@ where
     let device = session.raw_device();
     let queue = session.raw_queue();
 
-    // 1. Create a staging buffer
+    // Create a staging buffer
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Staging Download Buffer"),
         size: byte_size,
@@ -92,7 +92,7 @@ where
         mapped_at_creation: false,
     });
 
-    // 2. Command the GPU to copy from our Image buffer to the Staging buffer
+    // Command the GPU to copy from our Image buffer to the Staging buffer
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Download Encoder"),
     });
@@ -108,7 +108,7 @@ where
     // wgpu 28: submit() returns SubmissionIndex; pass it to poll for precise sync
     let submit_idx = queue.submit(std::iter::once(encoder.finish()));
 
-    // 3. Map the staging buffer using standard library channels
+    // Map the staging buffer using standard library channels
     let buffer_slice = staging_buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -116,7 +116,7 @@ where
         let _ = tx.send(result);
     });
 
-    // 4. Block the current thread until the GPU finishes this specific submission
+    // Block the current thread until the GPU finishes this specific submission
     device
         .poll(wgpu::PollType::Wait {
             submission_index: Some(submit_idx),
@@ -127,7 +127,7 @@ where
     // Ensure mapping succeeded
     rx.recv().unwrap().map_err(WgpuError::MapFailed)?;
 
-    // 5. Read the data, unmap, and construct the CPU image
+    // Read the data, unmap, and construct the CPU image
     let data: Vec<T> = {
         let mapped_view = buffer_slice.get_mapped_range();
         bytemuck::cast_slice::<u8, T>(&mapped_view).to_vec()
@@ -151,8 +151,6 @@ pub(crate) fn src_buffer<T, const C: usize>(
 pub(crate) fn src_buffer_tensor<T, const N: usize>(
     tensor: &Tensor<T, N, WgpuAllocator>,
 ) -> &wgpu::Buffer {
-    // We use the `.alloc()` getter provided by TensorStorage
-    // Assuming your WgpuAllocator struct has a public field named `buffer`
     &tensor.storage.alloc().gpu_buffer
 }
 
@@ -179,7 +177,11 @@ pub(crate) fn wrap_gpu_tensor<T, const N: usize>(
     // Locally sound for the same reason as wrap_gpu_buffer
     let storage = unsafe { TensorStorage::from_raw_parts(ptr, byte_size, allocator) };
 
-    Ok(Tensor { storage, shape, strides })
+    Ok(Tensor {
+        storage,
+        shape,
+        strides,
+    })
 }
 
 #[cfg(test)]

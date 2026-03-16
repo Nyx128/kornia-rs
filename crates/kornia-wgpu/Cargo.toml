@@ -34,3 +34,15 @@ naga-validation  = ["dep:naga"]
 [[bench]]
 name = "resize_bench"
 harness = false
+
+[[example]]
+name = "image_ops"
+path = "examples/image_ops.rs"
+
+[[example]]
+name = "tensor_ops"
+path = "examples/tensor_ops.rs"
+
+[[example]]
+name = "pipeline"
+path = "examples/pipeline.rs"

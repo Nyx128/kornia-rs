@@ -20,10 +20,6 @@ struct Params {
 }
 var<immediate> p: Params;
 
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>; 
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -63,39 +59,6 @@ fn compute_tensor_elementwise(
     let device = &device_arc.device;
     let queue = &device_arc.queue;
 
-    let bgl_entries = [
-        wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 2,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-    ];
-
     let key = PipelineKey {
         shader_id: ShaderKind::TensorElementwise,
         pixel_bytes: 4,
@@ -109,15 +72,16 @@ fn compute_tensor_elementwise(
         kind: ShaderKind::TensorElementwise,
         source: ELEMENTWISE_WGSL.to_string(),
     };
+    shader.build(); // now injects a, b, out declarations from bindings()
 
     let pipeline = device_arc.get_or_create_pipeline(
         key,
         &shader,
         std::mem::size_of::<ElemParams>() as u32,
-        &bgl_entries,
+        // no bgl_entries argument
     );
-    let bind_group_layout = pipeline.get_bind_group_layout(0);
 
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Elementwise Bind Group"),
         layout: &bind_group_layout,
@@ -129,7 +93,7 @@ fn compute_tensor_elementwise(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: in_b.as_entire_binding(),
-            }, // For unary, we just bind buffer A twice
+            },
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: out_buffer.as_entire_binding(),
@@ -148,7 +112,7 @@ fn compute_tensor_elementwise(
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_immediates(0, bytemuck::bytes_of(params));
 
-        let wg_x = (params.numel + 63) / 64; // Ceiling division for workgroup size 64
+        let wg_x = (params.numel + 63) / 64;
         cpass.dispatch_workgroups(wg_x, 1, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));

@@ -1,7 +1,7 @@
 // src/ops/resize.rs
-use crate::ops::{compute_1in_1out, create_storage_buffer};
 use crate::allocator::WgpuAllocator;
 use crate::error::WgpuError;
+use crate::ops::{compute_1in_1out, create_storage_buffer};
 use crate::session::WgpuSession;
 use crate::shader::ShaderKind;
 use crate::transfer::{src_buffer, wrap_gpu_buffer};
@@ -209,7 +209,7 @@ mod tests {
     fn test_resize_bilinear_f32_upscale() {
         let session = pollster::block_on(WgpuSession::new()).unwrap();
 
-        // 1. Create a 2x2 CPU image
+        // Create a 2x2 CPU image
         let in_size = ImageSize {
             width: 2,
             height: 2,
@@ -217,20 +217,20 @@ mod tests {
         let cpu_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let original_image = Image::<f32, 1, _>::new(in_size, cpu_data, CpuAllocator).unwrap();
 
-        // 2. Upload to GPU
+        // Upload to GPU
         let gpu_image = image_to_gpu(&session, &original_image).unwrap();
 
-        // 3. Resize to 4x4 using our new Bilinear function
+        // Resize to 4x4 using our new Bilinear function
         let out_size = ImageSize {
             width: 4,
             height: 4,
         };
         let resized_gpu = resize_bilinear_f32(&session, &gpu_image, out_size).unwrap();
 
-        // 4. Download the result back to CPU
+        // Download the result back to CPU
         let resized_cpu = image_to_cpu(&session, &resized_gpu).unwrap();
 
-        // 5. Verify the bilinear math!
+        // Verify the bilinear math
         // Top row blends 1.0 to 2.0. Bottom row blends 3.0 to 4.0.
         // Columns blend the top row into the bottom row.
         let expected_data: Vec<f32> = vec![

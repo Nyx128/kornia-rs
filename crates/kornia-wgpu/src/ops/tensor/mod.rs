@@ -14,4 +14,3 @@ impl GpuElement for u32 {
 impl GpuElement for i32 {
     const WGSL_TYPE: &'static str = "i32";
 }
-

@@ -31,7 +31,6 @@ fn bench_resize(c: &mut Criterion) {
         .raw_device()
         .poll(wgpu::PollType::wait_indefinitely());
 
-
     // GPU: Compute Only
     group.bench_function("GPU Compute Only", |b| {
         b.iter(|| {
@@ -42,7 +41,6 @@ fn bench_resize(c: &mut Criterion) {
             black_box(res)
         });
     });
-
 
     // GPU: End-to-End (RAM -> VRAM -> Math -> RAM)
     group.bench_function("GPU End-to-End", |b| {
@@ -56,7 +54,6 @@ fn bench_resize(c: &mut Criterion) {
             black_box(cpu_out)
         });
     });
-
 
     // CPU: Kornia Baseline (resize_native)
     // We pre-allocate the output buffer outside the iteration to
