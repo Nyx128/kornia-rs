@@ -2,24 +2,25 @@
 
 Hardware-Accelerated Image and Tensor Operations for Kornia-RS via WebGPU.
 
-This crate is a prototype and proposal for Google Summer of Code, aiming to introduce a lightweight, hardware-accelerated backend to the Kornia-RS ecosystem. 
+This crate is a prototype and proposal for Google Summer of Code, aiming to introduce a lightweight, hardware-accelerated backend to the Kornia-RS ecosystem.
 
 For detailed proposal document:
 [Google docs proposal](https://docs.google.com/document/d/1f9y_QCpjZI-XzioxuNEmyO0uMCO2iC9Z4pjMTrP8GLY/edit?usp=sharing)
 
 ## 📖 Synopsis
 
-Kornia-RS currently relies on CPU-bound operations. `kornia-wgpu` implements `ops::image` and `ops::tensor` modules to enable high-performance spatial image processing and multidimensional tensor math. 
+Kornia-RS currently relies on CPU-bound operations. `kornia-wgpu` implements `ops::image` and `ops::tensor` modules to enable high-performance spatial image processing and multidimensional tensor math.
 
 Built entirely on safe Rust abstractions, it uses `wgpu` (targeting v28.0.0) to provide a portable GPU compute backend across Vulkan, Metal, DX12, and WebGL. This preserves Kornia-RS's lightweight philosophy by avoiding heavyweight dependencies like CUDA or BLAS.
 
 ## ✨ Key Features
 
 * **Cross-Platform GPU Compute:** Runs on Vulkan, Metal, DX12, and WebGL via WGSL shaders.
-* **Zero-Copy Chaining:** Execute multiple operations sequentially in VRAM. The GPU reads its own outputs as the next operation's inputs without implicit memory transfers back to the CPU.
+* **Zero-Copy GPU Chaining:** Execute multiple operations sequentially in VRAM. The GPU reads its own outputs as the next operation's inputs without any PCIe transfers between ops.
+* **Real-Time Video Processing:** Grab live frames from cameras or RTSP streams via `kornia-io`, process them on the GPU, and stream results — all without leaving Rust. Benchmarked at 20-25× faster than CPU for resize operations on an RTX 4060.
 * **Dynamic Pipeline Caching:** `WgpuSession` owns the device and queue, and caches compiled WGSL pipelines. Each `(op, type)` pair is compiled exactly once, avoiding expensive shader compilations during hot loops.
 * **Unconditionally Safe Data Transfers:** Uses `bytemuck` and a `Pod` supertrait to mathematically guarantee there are no padding bytes, making CPU ↔ GPU byte reinterpretations completely safe.
-* **Native-feel u8 Support:** Uses bit-shifting and masking within WGSL to pack/unpack four 8-bit pixels into contiguous `u32` buffers, maximizing VRAM throughput since WGSL lacks native `u8` arrays.
+* **Native-feel u8 Support:** The `cast_and_scale` GPU kernel uploads raw u8 frames directly and divides by 255 in the shader — eliminating the CPU cast bottleneck that would otherwise cost ~18ms per 720p frame.
 
 ## 🏗️ Architecture
 
@@ -31,7 +32,7 @@ flowchart TB
 
     subgraph OPS["  Ops layer  "]
         OI["ops::image
-        resize · grayscale · flip · normalize · filters"]:::ops
+        resize · cast_and_scale · grayscale · flip · normalize · filters"]:::ops
         OT["ops::tensor
         elementwise · reductions · activations · matmul"]:::ops
     end
@@ -63,137 +64,146 @@ flowchart TB
     classDef memory  fill:#FAECE7,stroke:#993C1D,color:#712B13
     classDef wgpu    fill:#F1EFE8,stroke:#5F5E5A,color:#444441
 ```
+
+---
+
 # 🚀 Examples
 
-The following examples demonstrate how to construct pipelines that
-maximize GPU utilization by chaining operations in VRAM.
+The following examples demonstrate how to construct pipelines that maximize GPU utilization by chaining operations in VRAM.
 
-------------------------------------------------------------------------
+---
 
 ## 1. Initialization
 
 All workflows begin by initializing a shared `WgpuSession`.
 
-``` rust
+```rust
 use kornia_wgpu::session::WgpuSession;
 
 // WgpuSession owns the wgpu Device + Queue and the pipeline cache.
+// Create once and pass by reference to every op.
 let session = pollster::block_on(WgpuSession::new())?;
 ```
 
-------------------------------------------------------------------------
+---
 
 ## 2. Image Processing Pipeline
 
-Simulates a pre-processing step: downsample to a thumbnail (nearest),
-then to a precise model input size (bilinear). The two GPU ops are
-chained without any CPU round-trip between them.
+Downsample to a thumbnail (nearest), then to a precise model input size (bilinear). The two GPU ops are chained without any CPU round-trip between them.
 
-``` rust
+```rust
 use kornia_image::{allocator::CpuAllocator, Image, ImageSize};
 use kornia_wgpu::ops::image::resize::{resize_bilinear_f32, resize_nearest_f32};
 use kornia_wgpu::transfer::{image_to_cpu, image_to_gpu};
 
-// 1. Create a CPU image
-let src_size = ImageSize { width: 8, height: 8 };
-let cpu_src = Image::<f32, 1, _>::new(
-    src_size,
-    (0..64).map(|i| i as f32 * 0.01).collect(),
-    CpuAllocator,
-)?;
-
-// 2. Cross the PCIe boundary (CPU -> VRAM)
 let gpu_src = image_to_gpu(&session, &cpu_src)?;
 
-// 3. Op 1: Nearest resize (8x8 -> 4x4)
-let gpu_thumb = resize_nearest_f32(
-    &session,
-    &gpu_src,
-    ImageSize { width: 4, height: 4 },
-)?;
+// Op 1 → Op 2: chained entirely in VRAM, zero PCIe between them
+let gpu_thumb    = resize_nearest_f32(&session, &gpu_src,   ImageSize { width: 4, height: 4 })?;
+let gpu_model_in = resize_bilinear_f32(&session, &gpu_thumb, ImageSize { width: 3, height: 3 })?;
 
-// 4. Op 2: Bilinear resize (4x4 -> 3x3)
-// gpu_thumb is entirely in VRAM — no PCIe transfer between these two ops.
-let gpu_model_in = resize_bilinear_f32(
-    &session,
-    &gpu_thumb,
-    ImageSize { width: 3, height: 3 },
-)?;
-
-// 5. Sync and download (VRAM -> CPU)
 let _ = session.raw_device().poll(wgpu::PollType::wait_indefinitely());
 let cpu_result = image_to_cpu(&session, &gpu_model_in)?;
 ```
 
-------------------------------------------------------------------------
+---
 
 ## 3. Tensor Math & Large Workloads
 
-Simulates post-processing: element-wise add two feature maps, then apply
-ReLU.
+Element-wise add two feature maps, then apply ReLU. The add output stays in VRAM and feeds directly into relu — no download between ops.
 
-``` rust
+```rust
 use kornia_tensor::{CpuAllocator, Tensor};
 use kornia_wgpu::ops::tensor::elementwise::{add, relu};
 
-let n = 1_000_000usize;
+let gpu_a = session.upload_tensor(&cpu_a)?;
+let gpu_b = session.upload_tensor(&cpu_b)?;
 
-let big_a = Tensor::from_shape_vec(
-    [n],
-    (0..n).map(|i| i as f32).collect(),
-    CpuAllocator,
-)?;
+let gpu_sum  = add(&session, &gpu_a, &gpu_b)?;   // stays in VRAM
+let gpu_relu = relu(&session, &gpu_sum)?;          // reads VRAM output of add
 
-let big_b = Tensor::from_shape_vec(
-    [n],
-    (0..n).map(|i| -(i as f32)).collect(),
-    CpuAllocator,
-)?;
-
-// 1. Upload tensors to GPU
-let gpu_big_a = session.upload_tensor(&big_a)?;
-let gpu_big_b = session.upload_tensor(&big_b)?;
-
-// 2. Binary Op: Add
-// Result stays in VRAM as a WgpuAllocator tensor.
-let gpu_big_sum = add(&session, &gpu_big_a, &gpu_big_b)?;
-
-// 3. Unary Op: ReLU
-// Reads gpu_big_sum from VRAM, no CPU round-trip
-let gpu_big_relu = relu(&session, &gpu_big_sum)?;
-
-// 4. Poll and download
 let _ = session.raw_device().poll(wgpu::PollType::wait_indefinitely());
-let cpu_big_relu = session.download_tensor(&gpu_big_relu)?;
+let result = session.download_tensor(&gpu_relu)?;
 ```
 
-------------------------------------------------------------------------
+---
+
+## 4. Real-Time Video Pipeline
+
+Grab live 720p frames from an RTSP stream, upscale to 1080p on the GPU using bilinear resize. Each frame crosses the PCIe bus exactly once on upload — the cast from u8 to f32 and the resize both happen in VRAM.
+
+```
+RTSP H.265 frame (u8)
+  → cast_u8_to_f32_gpu   uploads u8, divides by 255 in shader  (PCIe crossing #1)
+  → resize_bilinear_f32  1280×720 → 1920×1080                  (VRAM only)
+  → image_to_cpu                                                (PCIe crossing #2)
+```
+
+```rust
+use kornia_io::gstreamer::StreamCapture;
+use kornia_wgpu::ops::image::cast::cast_u8_to_f32_gpu;
+use kornia_wgpu::ops::image::resize::resize_bilinear_f32;
+use kornia_wgpu::transfer::image_to_cpu;
+
+let pipeline_desc = format!(
+    "rtspsrc location={url} latency=0 ! rtph265depay ! avdec_h265 ! \
+     videoconvert ! video/x-raw,format=RGB ! appsink name=sink"
+);
+let mut capture = StreamCapture::new(&pipeline_desc)?;
+capture.start()?;
+
+let out_size = ImageSize { width: 1920, height: 1080 };
+
+loop {
+    let Some(frame) = capture.grab_rgb8()? else { continue; };
+
+    // u8 bytes go straight to GPU — no intermediate Vec<f32> on the CPU
+    let gpu_f32  = cast_u8_to_f32_gpu(&session, &frame)?;
+    let gpu_1080 = resize_bilinear_f32(&session, &gpu_f32, out_size)?;
+
+    session.raw_device().poll(wgpu::PollType::wait_indefinitely());
+    let result = image_to_cpu(&session, &gpu_1080)?;
+}
+```
+
+Run the full example with:
+
+```bash
+cargo run --example video_pipeline --features gstreamer -- <rtsp-url>
+```
+
+---
 
 # 🗺️ Roadmap (GSoC Deliverables)
 
 ## Core Infrastructure
 
--   `WgpuSession`
--   `WgpuAllocator`
--   `PipelineKey` cache
--   `bytemuck` data transfers
+- `WgpuSession` — device, queue, pipeline cache
+- `WgpuAllocator` — GPU buffer + CPU backing, safe integration with `TensorStorage`
+- `PipelineKey` cache — compile each shader exactly once
+- `bytemuck` data transfers — Pod-guaranteed safe byte casts at every CPU↔GPU boundary
 
 ## Image Operations (`ops::image`)
 
--   Resize (Nearest, Bilinear)
--   Grayscale
--   Flip
--   Normalize
--   Filters(Box, Gauss, Sobel,..)
+- Cast and scale: `cast_u8_to_f32` (GPU kernel, eliminates CPU cast bottleneck)
+- Resize: nearest-neighbour, bilinear (1-channel and multi-channel)
+- Grayscale
+- Flip
+- Normalize
+- Filters: box, Gaussian, Sobel
 
 ## Tensor Operations (`ops::tensor`)
 
--   Elementwise math: `add`, `sub`, `mul`, `div`
--   Activations: `relu`, `exp`, `log`, `abs`
-- tensor reductions
+- Elementwise math: `add`, `sub`, `mul`, `div`
+- Activations: `relu`, `exp`, `log`, `abs`
+- Tensor reductions: `sum`, `mean`, `min`, `max`
 
 ## Stretch Goals / Future Work
--   Batched matrix multiplication
--   Texture-based image pipelines
 
-Authored by Neelabhro Ghosh(@Nyx128) ;)
+- Batched matrix multiplication
+- Perspective warp / homography (for bird's-eye view on Jetson Orin via Bubbaloop)
+- Texture-based image pipelines
+
+---
+
+Authored by Neelabhro Ghosh ([@Nyx128](https://github.com/Nyx128)) 🦀
