@@ -5,6 +5,7 @@ use std::sync::Arc;
 use kornia_image::allocator::ImageAllocator;
 use kornia_tensor::{allocator::TensorAllocatorError, TensorAllocator};
 
+#[allow(dead_code)]
 // Add Debug to the derive macro
 #[derive(Clone, Debug)]
 pub struct WgpuAllocator {

@@ -112,7 +112,7 @@ fn compute_tensor_elementwise(
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_immediates(0, bytemuck::bytes_of(params));
 
-        let wg_x = (params.numel + 63) / 64;
+        let wg_x = params.numel.div_ceil(64);
         cpass.dispatch_workgroups(wg_x, 1, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));
@@ -139,12 +139,7 @@ pub fn add<const N: usize>(
 
     compute_tensor_elementwise(session, buf_a, buf_b, &out_buffer, &params);
 
-    crate::transfer::wrap_gpu_tensor(
-        a.shape.clone(),
-        a.strides.clone(),
-        out_buffer,
-        session.raw_device_arc(),
-    )
+    crate::transfer::wrap_gpu_tensor(a.shape, a.strides, out_buffer, session.raw_device_arc())
 }
 
 /// Applies the Rectified Linear Unit function (Unary)
@@ -167,12 +162,7 @@ pub fn relu<const N: usize>(
     // For unary, we safely pass `buf_a` as both inputs. The shader ignores `b`.
     compute_tensor_elementwise(session, buf_a, buf_a, &out_buffer, &params);
 
-    crate::transfer::wrap_gpu_tensor(
-        a.shape.clone(),
-        a.strides.clone(),
-        out_buffer,
-        session.raw_device_arc(),
-    )
+    crate::transfer::wrap_gpu_tensor(a.shape, a.strides, out_buffer, session.raw_device_arc())
 }
 
 #[cfg(test)]

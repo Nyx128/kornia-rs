@@ -63,12 +63,7 @@ impl WgpuSession {
         queue.write_buffer(&gpu_buffer, 0, bytes);
 
         // Wrap it in our GPU allocator
-        crate::transfer::wrap_gpu_tensor(
-            src.shape.clone(),
-            src.strides.clone(),
-            gpu_buffer,
-            device_arc.clone(),
-        )
+        crate::transfer::wrap_gpu_tensor(src.shape, src.strides, gpu_buffer, device_arc.clone())
     }
 
     /// Downloads a GPU Tensor back to the CPU
@@ -119,7 +114,7 @@ impl WgpuSession {
         drop(mapped_view);
         staging_buffer.unmap();
 
-        Ok(Tensor::from_shape_vec(src.shape.clone(), cpu_vec, CpuAllocator).unwrap())
+        Ok(Tensor::from_shape_vec(src.shape, cpu_vec, CpuAllocator).unwrap())
     }
 }
 
@@ -148,7 +143,7 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        let cpu_backing = Arc::new(vec![0u8; 4 as usize]);
+        let cpu_backing = Arc::new(vec![0u8; 4_usize]);
 
         let alloc = WgpuAllocator {
             device: session.device.clone(),

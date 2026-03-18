@@ -20,6 +20,7 @@ pub(crate) fn create_storage_buffer(
 }
 
 /// A generic dispatcher for operations that take 1 input buffer and write to 1 output buffer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_1in_1out<I: bytemuck::Pod>(
     session: &WgpuSession,
     shader_id: ShaderKind,
@@ -82,8 +83,8 @@ pub(crate) fn compute_1in_1out<I: bytemuck::Pod>(
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_immediates(0, bytemuck::bytes_of(immediates));
 
-        let wg_x = (dispatch_size.0 + workgroup_size.0 as u32 - 1) / workgroup_size.0 as u32;
-        let wg_y = (dispatch_size.1 + workgroup_size.1 as u32 - 1) / workgroup_size.1 as u32;
+        let wg_x = dispatch_size.0.div_ceil(workgroup_size.0 as u32);
+        let wg_y = dispatch_size.1.div_ceil(workgroup_size.1 as u32);
         cpass.dispatch_workgroups(wg_x, wg_y, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));

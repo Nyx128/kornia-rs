@@ -22,6 +22,7 @@ impl Default for DeviceOptions {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct WgpuDevice {
     pub device: wgpu::Device,
@@ -30,7 +31,7 @@ pub(crate) struct WgpuDevice {
     pub features: wgpu::Features,
     pub workgroup_size: (u32, u32),
     pipeline_cache: Mutex<HashMap<PipelineKey, Arc<wgpu::ComputePipeline>>>,
-    // staging_pool: Mutex<StagingPool>,
+    // staging_pool: Mutex<StagingPool>, will be considered later on
 }
 
 impl WgpuDevice {

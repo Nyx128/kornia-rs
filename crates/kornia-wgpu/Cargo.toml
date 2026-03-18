@@ -14,6 +14,7 @@ include = { workspace = true }
 kornia-tensor = { workspace = true }
 kornia-image  = { workspace = true }
 kornia-imgproc = {workspace =true}
+kornia-io = {workspace = true, features=["gstreamer"]}
 wgpu     = { version = "28", features = ["wgsl"] }
 bytemuck = { version = "1",  features = ["derive"] }
 thiserror = { workspace = true }
@@ -46,3 +47,7 @@ path = "examples/tensor_ops.rs"
 [[example]]
 name = "pipeline"
 path = "examples/pipeline.rs"
+
+[[example]]
+name = "video_pipeline"
+path = "examples/video_pipeline.rs"
