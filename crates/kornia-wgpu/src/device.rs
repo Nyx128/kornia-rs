@@ -99,7 +99,7 @@ impl WgpuDevice {
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(&format!("{:?}", key.shader_id)),
+                label: Some(&format!("{:?}", key.shader_name)),
                 source: wgpu::ShaderSource::Wgsl(shader.source.as_str().into()),
             });
 
@@ -143,7 +143,7 @@ impl WgpuDevice {
 
         let pipeline = Arc::new(self.device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("{:?} Pipeline", key.shader_id)),
+                label: Some(&format!("{:?} Pipeline", key.shader_name)),
                 layout: Some(&pipeline_layout),
                 module: &module,
                 entry_point: Some("main"),

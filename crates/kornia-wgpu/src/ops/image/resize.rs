@@ -3,7 +3,7 @@ use crate::allocator::WgpuAllocator;
 use crate::error::WgpuError;
 use crate::ops::{compute_1in_1out, create_storage_buffer};
 use crate::session::WgpuSession;
-use crate::shader::ShaderKind;
+use crate::shader::{RESIZE_BILINEAR, RESIZE_NEAREST};
 use crate::transfer::{src_buffer, wrap_gpu_buffer};
 use kornia_image::{Image, ImageSize};
 
@@ -116,7 +116,7 @@ pub fn resize_nearest_f32<const C: usize>(
 
     compute_1in_1out(
         session,
-        ShaderKind::ResizeNearest,
+        &RESIZE_NEAREST,
         RESIZE_WGSL,
         src_buffer(input),
         &out_buffer,
@@ -150,7 +150,7 @@ pub fn resize_bilinear_f32<const C: usize>(
 
     compute_1in_1out(
         session,
-        ShaderKind::ResizeBilinear,
+        &RESIZE_BILINEAR,
         RESIZE_BILINEAR_WGSL,
         src_buffer(input),
         &out_buffer,

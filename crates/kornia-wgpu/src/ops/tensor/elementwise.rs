@@ -1,7 +1,7 @@
 use crate::allocator::WgpuAllocator;
 use crate::error::WgpuError;
 use crate::session::WgpuSession;
-use crate::shader::{PipelineKey, ShaderKind, WgslShader};
+use crate::shader::{PipelineKey, WgslShader, TENSOR_ELEMENTWISE};
 use kornia_tensor::Tensor;
 
 #[repr(C)]
@@ -59,17 +59,10 @@ fn compute_tensor_elementwise(
     let device = &device_arc.device;
     let queue = &device_arc.queue;
 
-    let key = PipelineKey {
-        shader_id: ShaderKind::TensorElementwise,
-        pixel_bytes: 4,
-        channels: 1,
-        wg_x: 64,
-        wg_y: 1,
-        variant: 0,
-    };
+    let key = PipelineKey::from_kind(&TENSOR_ELEMENTWISE.clone(), 4, 1, 64, 1, 0);
 
     let mut shader = WgslShader {
-        kind: ShaderKind::TensorElementwise,
+        kind: TENSOR_ELEMENTWISE.clone(),
         source: ELEMENTWISE_WGSL.to_string(),
     };
     shader.build(); // now injects a, b, out declarations from bindings()

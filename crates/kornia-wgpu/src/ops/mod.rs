@@ -23,7 +23,7 @@ pub(crate) fn create_storage_buffer(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_1in_1out<I: bytemuck::Pod>(
     session: &WgpuSession,
-    shader_id: ShaderKind,
+    shader_kind: &'static ShaderKind,
     shader_source: &'static str,
     in_buffer: &wgpu::Buffer,
     out_buffer: &wgpu::Buffer,
@@ -37,17 +37,17 @@ pub(crate) fn compute_1in_1out<I: bytemuck::Pod>(
     let device = &device_arc.device;
     let queue = &device_arc.queue;
 
-    let key = PipelineKey {
-        shader_id: shader_id.clone(),
+    let key = PipelineKey::from_kind(
+        shader_kind,
         pixel_bytes,
         channels,
-        wg_x: workgroup_size.0,
-        wg_y: workgroup_size.1,
-        variant: 0,
-    };
+        workgroup_size.0,
+        workgroup_size.1,
+        0,
+    );
 
     let mut shader = WgslShader {
-        kind: shader_id,
+        kind: shader_kind.clone(),
         source: shader_source.to_string(),
     };
     shader.build();
