@@ -6,6 +6,7 @@ This crate is a prototype and GSoC proposal for introducing a lightweight, porta
 
 [Google Docs proposal](https://docs.google.com/document/d/1f9y_QCpjZI-XzioxuNEmyO0uMCO2iC9Z4pjMTrP8GLY/edit?usp=sharing)
 
+#### For the maintainers: feel free to comment any suggestions and improvements, in case there are some inconsistencies.
 ---
 
 ## Synopsis
