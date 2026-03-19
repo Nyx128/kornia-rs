@@ -1,213 +1,203 @@
 use crate::allocator::WgpuAllocator;
-use crate::device::WgpuDevice;
 use crate::error::WgpuError;
+use crate::gpu_res::{GpuImage, GpuTensor};
 use crate::pixel::GpuPixel;
 use crate::session::WgpuSession;
 use kornia_image::allocator::{CpuAllocator, ImageAllocator};
 use kornia_image::{Image, ImageSize};
 use kornia_tensor::storage::TensorStorage;
 use kornia_tensor::Tensor;
-use std::sync::Arc;
 
-pub(crate) fn wrap_gpu_buffer<T: GpuPixel, const C: usize>(
+/// Wrap a `WgpuAllocator` into a `GpuImage`.
+///
+/// SAFETY: `TensorStorage::ptr` is `NonNull::dangling()`. The inner Image
+/// must never have `.as_slice()` called on it — `GpuImage` enforces this
+/// by not exposing that method.
+///
+/// # Arguments
+///
+/// * `size` - Dimensions of the resulting image.
+/// * `alloc` - Pre-allocated WGPU memory.
+///
+/// # Returns
+///
+/// A wrapped [`GpuImage`].
+///
+/// # Errors
+///
+/// Currently always returns `Ok`, using `Result` for API consistency.
+pub fn wrap_gpu_buffer<T: GpuPixel, const C: usize>(
     size: ImageSize,
-    buffer: wgpu::Buffer,
-    device: Arc<WgpuDevice>,
-) -> Result<Image<T, C, WgpuAllocator>, WgpuError> {
+    alloc: WgpuAllocator,
+) -> Result<GpuImage<T, C>, WgpuError> {
     let numel = size.width * size.height * C;
-    let byte_size = numel * std::mem::size_of::<T>();
-
-    // Allocate zeroed CPU backing so TensorStorage::ptr is valid (never dangling)
-    let cpu_backing = Arc::new(vec![0u8; byte_size]);
-
-    let alloc = WgpuAllocator {
-        device,
-        gpu_buffer: Arc::new(buffer),
-        cpu_backing: cpu_backing.clone(),
+    let storage = unsafe {
+        TensorStorage::from_raw_parts(
+            std::ptr::NonNull::<T>::dangling().as_ptr(),
+            numel * std::mem::size_of::<T>(),
+            alloc,
+        )
     };
-
-    // Get a real pointer into cpu_backing — safe because Arc keeps it alive
-    let ptr = cpu_backing.as_ptr() as *const T;
-
-    // This unsafe block is now locally sound: ptr is valid for numel elements
-    // and cpu_backing in alloc keeps it alive for the lifetime of the Image.
-    unsafe {
-        Image::from_raw_parts(size, ptr, numel, alloc)
-            .map_err(|e| WgpuError::ImageError(e.to_string()))
-    }
+    Ok(GpuImage(Image(Tensor {
+        storage,
+        shape: [size.height, size.width, C],
+        strides: [size.width * C, C, 1],
+    })))
 }
 
-/// Uploads a CPU image to the GPU.
+/// Upload a CPU image to the GPU via the compute pool.
+///
+/// # Arguments
+///
+/// * `session` - The active `WgpuSession`.
+/// * `cpu_image` - The input image residing in CPU memory.
+///
+/// # Returns
+///
+/// A [`GpuImage`] whose data has been uploaded to VRAM.
+///
+/// # Errors
+///
+/// Passes through appropriate device errors up from mapping or similar issues.
 pub fn image_to_gpu<T, const C: usize, A>(
     session: &WgpuSession,
     cpu_image: &Image<T, C, A>,
-) -> Result<Image<T, C, WgpuAllocator>, WgpuError>
+) -> Result<GpuImage<T, C>, WgpuError>
 where
     T: GpuPixel,
     A: ImageAllocator,
 {
     let size = cpu_image.size();
-    let numel = size.width * size.height * C;
-    let byte_size = (numel * std::mem::size_of::<T>()) as wgpu::BufferAddress;
+    let byte_size = (size.width * size.height * C * std::mem::size_of::<T>()) as u64;
 
-    // Create a storage buffer on the GPU
-    let buffer = session.raw_device().create_buffer(&wgpu::BufferDescriptor {
-        label: Some("GPU Image Buffer"),
-        size: byte_size,
-        // STORAGE for compute shaders, COPY_DST to write to it, COPY_SRC to read back
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let alloc = session.acquire_compute(byte_size);
+    session.raw_queue().write_buffer(
+        alloc.gpu_buffer(),
+        0,
+        bytemuck::cast_slice(cpu_image.as_slice()),
+    );
 
-    // Write the data to the buffer
-    // bytemuck safely casts our strongly-typed pixel slice to raw bytes
-    let byte_slice = bytemuck::cast_slice(cpu_image.as_slice());
-    session.raw_queue().write_buffer(&buffer, 0, byte_slice);
-
-    // Wrap the new buffer in our custom allocator
-    wrap_gpu_buffer(size, buffer, session.device.clone())
+    wrap_gpu_buffer(size, alloc)
 }
 
+/// Download a GPU image to CPU RAM via the staging pool.
+///
+/// # Arguments
+///
+/// * `session` - The active `WgpuSession`.
+/// * `gpu_image` - The input image residing in GPU memory.
+///
+/// # Returns
+///
+/// A generic `Image` mapped in CPU memory.
+///
+/// # Errors
+///
+/// Returns a [`WgpuError`] if mapping the underlying buffer fails.
 pub fn image_to_cpu<T, const C: usize>(
     session: &WgpuSession,
-    gpu_image: &Image<T, C, WgpuAllocator>,
+    gpu_image: &GpuImage<T, C>,
 ) -> Result<Image<T, C, CpuAllocator>, WgpuError>
 where
     T: GpuPixel + Clone,
 {
     let size = gpu_image.size();
     let numel = size.width * size.height * C;
-    let byte_size = (numel * std::mem::size_of::<T>()) as wgpu::BufferAddress;
+    let byte_size = (numel * std::mem::size_of::<T>()) as u64;
 
     let device = session.raw_device();
     let queue = session.raw_queue();
+    let staging = session.staging_pool.acquire(device, byte_size);
 
-    // Create a staging buffer
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Staging Download Buffer"),
-        size: byte_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // Command the GPU to copy from our Image buffer to the Staging buffer
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Download Encoder"),
+        label: Some("img-download"),
     });
-
     encoder.copy_buffer_to_buffer(
-        &gpu_image.storage.alloc().gpu_buffer,
+        gpu_image.0.storage.alloc().gpu_buffer(),
         0,
-        &staging_buffer,
+        &staging,
         0,
         byte_size,
     );
-
-    // wgpu 28: submit() returns SubmissionIndex; pass it to poll for precise sync
     let submit_idx = queue.submit(std::iter::once(encoder.finish()));
 
-    // Map the staging buffer using standard library channels
-    let buffer_slice = staging_buffer.slice(..);
+    let slice = staging.slice(..byte_size);
     let (tx, rx) = std::sync::mpsc::channel();
-
-    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
     });
-
-    // Block the current thread until the GPU finishes this specific submission
     device
         .poll(wgpu::PollType::Wait {
             submission_index: Some(submit_idx),
-            timeout: None, // wait indefinitely
+            timeout: None,
         })
         .unwrap();
-
-    // Ensure mapping succeeded
     rx.recv().unwrap().map_err(WgpuError::MapFailed)?;
 
-    // Read the data, unmap, and construct the CPU image
-    let data: Vec<T> = {
-        let mapped_view = buffer_slice.get_mapped_range();
-        bytemuck::cast_slice::<u8, T>(&mapped_view).to_vec()
-    };
+    let data: Vec<T> = bytemuck::cast_slice::<u8, T>(&slice.get_mapped_range()).to_vec();
 
-    staging_buffer.unmap();
+    staging.unmap();
+    session.staging_pool.release(staging);
 
-    // Image::new generally defaults to CpuAllocator in Kornia
     Image::new(size, data, CpuAllocator).map_err(|e| WgpuError::ImageError(e.to_string()))
 }
 
-/// Helper to quickly extract the underlying wgpu::Buffer from a GPU image
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
 #[inline]
-pub(crate) fn src_buffer<T, const C: usize>(
-    img: &kornia_image::Image<T, C, WgpuAllocator>,
-) -> &wgpu::Buffer {
-    &img.storage.alloc().gpu_buffer
+pub(crate) fn src_buffer<T, const C: usize>(img: &GpuImage<T, C>) -> &wgpu::Buffer {
+    img.0.storage.alloc().gpu_buffer()
 }
 
-/// Extracts the raw wgpu::Buffer reference from a GPU Tensor
-pub(crate) fn src_buffer_tensor<T, const N: usize>(
-    tensor: &Tensor<T, N, WgpuAllocator>,
-) -> &wgpu::Buffer {
-    &tensor.storage.alloc().gpu_buffer
+#[inline]
+pub(crate) fn src_buffer_tensor<T, const N: usize>(tensor: &GpuTensor<T, N>) -> &wgpu::Buffer {
+    tensor.0.storage.alloc().gpu_buffer()
 }
 
-/// Wraps a newly computed wgpu::Buffer into a full Kornia Tensor
+/// Wrap a `WgpuAllocator` into a `GpuTensor`.
 pub(crate) fn wrap_gpu_tensor<T, const N: usize>(
     shape: [usize; N],
     strides: [usize; N],
-    buffer: wgpu::Buffer,
-    device: Arc<WgpuDevice>,
-) -> Result<Tensor<T, N, WgpuAllocator>, WgpuError> {
-    let numel = shape.iter().product::<usize>();
-    let byte_size = numel * std::mem::size_of::<T>();
-
-    let cpu_backing = Arc::new(vec![0u8; byte_size]);
-
-    let allocator = WgpuAllocator {
-        device,
-        gpu_buffer: Arc::new(buffer),
-        cpu_backing: cpu_backing.clone(),
+    alloc: WgpuAllocator,
+) -> Result<GpuTensor<T, N>, WgpuError> {
+    let byte_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+    let storage = unsafe {
+        TensorStorage::from_raw_parts(
+            std::ptr::NonNull::<T>::dangling().as_ptr(),
+            byte_size,
+            alloc,
+        )
     };
-
-    let ptr = cpu_backing.as_ptr() as *const T;
-
-    // Locally sound for the same reason as wrap_gpu_buffer
-    let storage = unsafe { TensorStorage::from_raw_parts(ptr, byte_size, allocator) };
-
-    Ok(Tensor {
+    Ok(GpuTensor(Tensor {
         storage,
         shape,
         strides,
-    })
+    }))
+}
+
+/// Acquire a pooled output allocator for an op.
+pub(crate) fn acquire_output(session: &WgpuSession, byte_size: u64) -> WgpuAllocator {
+    session.acquire_compute(byte_size)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kornia_image::{Image, ImageSize};
-    use kornia_tensor::allocator::CpuAllocator; // Ensure this is imported
+    use kornia_tensor::allocator::CpuAllocator;
 
     #[test]
     fn test_gpu_round_trip() {
         let session = pollster::block_on(WgpuSession::new()).unwrap();
-
         let size = ImageSize {
             width: 2,
             height: 2,
         };
-        let cpu_data: Vec<u8> = vec![10, 20, 30, 40];
+        let original = Image::<u8, 1, _>::new(size, vec![10, 20, 30, 40], CpuAllocator).unwrap();
 
-        // Explicitly tell Rust this is a 1-channel u8 image
-        let original_image = Image::<u8, 1, _>::new(size, cpu_data, CpuAllocator).unwrap();
+        let gpu = image_to_gpu(&session, &original).expect("upload failed");
+        let downloaded = image_to_cpu(&session, &gpu).expect("download failed");
 
-        let gpu_image = image_to_gpu(&session, &original_image).expect("Failed to upload to GPU");
-
-        let downloaded_image =
-            image_to_cpu(&session, &gpu_image).expect("Failed to download to CPU");
-
-        assert_eq!(original_image.as_slice(), downloaded_image.as_slice());
+        assert_eq!(original.as_slice(), downloaded.as_slice());
     }
 }

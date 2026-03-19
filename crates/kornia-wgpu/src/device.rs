@@ -4,6 +4,7 @@ use crate::shader::{PipelineKey, WgslShader};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Configuration options for creating a [`WgpuDevice`].
 pub struct DeviceOptions {
     pub backend: Option<wgpu::Backends>,
     pub power_preference: wgpu::PowerPreference,

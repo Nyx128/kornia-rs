@@ -33,7 +33,11 @@ profiling        = []
 naga-validation  = ["dep:naga"]
 
 [[bench]]
-name = "resize_bench"
+name = "bench_resize"
+harness = false
+
+[[bench]]
+name = "bench_tensor_ops"
 harness = false
 
 [[example]]

@@ -1,160 +1,345 @@
+use crate::allocator::{PooledBufferGuard, WgpuAllocator};
 use crate::device::{DeviceOptions, WgpuDevice};
 use crate::error::WgpuError;
+use crate::gpu_res::GpuTensor;
 use crate::ops::tensor::GpuElement;
-use std::sync::Arc;
-
-use crate::allocator::WgpuAllocator;
+use crate::pool::{BufferPool, StagingPoolMap};
 use kornia_tensor::allocator::CpuAllocator;
 use kornia_tensor::Tensor;
+use std::sync::Arc;
 
+/// A session for executing compute operations on the GPU.
+///
+/// This holds the core device, queue, and resource pools needed to
+/// run operations and manage memory efficiently.
 #[derive(Clone)]
 pub struct WgpuSession {
     pub(crate) device: Arc<WgpuDevice>,
+    pub(crate) compute_pool: Arc<BufferPool>,
+    pub(crate) staging_pool: Arc<StagingPoolMap>,
 }
 
 impl WgpuSession {
+    /// Creates a new `WgpuSession` with default options.
+    ///
+    /// # Returns
+    ///
+    /// A new [`WgpuSession`] or an error if initialization fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WgpuError`] if the GPU device could not be acquired.
     pub async fn new() -> Result<Self, WgpuError> {
         Self::with_options(DeviceOptions::default()).await
     }
 
+    /// Creates a new `WgpuSession` with the specified options.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Configuration options for device creation.
+    ///
+    /// # Returns
+    ///
+    /// A new [`WgpuSession`] or an error if initialization fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WgpuError`] if the GPU device could not be acquired.
     pub async fn with_options(options: DeviceOptions) -> Result<Self, WgpuError> {
         let device = WgpuDevice::new(options).await?;
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            compute_pool: Arc::new(BufferPool::new(4)),
+            staging_pool: Arc::new(StagingPoolMap::new(3)),
+        })
     }
 
+    /// Returns a reference to the raw `wgpu::Device`.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the [`wgpu::Device`].
     pub fn raw_device(&self) -> &wgpu::Device {
         &self.device.device
     }
+    /// Returns a reference to the raw `wgpu::Queue`.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the [`wgpu::Queue`].
     pub fn raw_queue(&self) -> &wgpu::Queue {
         &self.device.queue
     }
-
-    pub(crate) fn raw_device_arc(&self) -> std::sync::Arc<WgpuDevice> {
+    pub(crate) fn raw_device_arc(&self) -> Arc<WgpuDevice> {
         self.device.clone()
     }
 
-    /// Uploads a CPU Tensor to the GPU
+    /// Acquire a pooled compute buffer and wrap it in a `WgpuAllocator`.
+    ///
+    /// This is the single entry point for all compute buffer allocation.
+    /// `transfer::image_to_gpu`, `upload_tensor`, and every op output go
+    /// through here. The buffer is returned to the pool automatically when
+    /// the last clone of the returned `WgpuAllocator` is dropped.
+    pub(crate) fn acquire_compute(&self, byte_size: u64) -> WgpuAllocator {
+        let buffer = self.compute_pool.acquire(self.raw_device(), byte_size);
+        WgpuAllocator {
+            device: self.device.clone(),
+            guard: Arc::new(PooledBufferGuard::pooled(buffer, self.compute_pool.clone())),
+        }
+    }
+
+    /// Upload a CPU tensor to the GPU via the compute pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `src` - The CPU tensor to upload.
+    ///
+    /// # Returns
+    ///
+    /// A new [`GpuTensor`] residing on the GPU.
+    ///
+    /// # Errors
+    ///
+    /// Can return a [`WgpuError`] if buffer upload fails.
     pub fn upload_tensor<T, const N: usize>(
         &self,
         src: &Tensor<T, N, CpuAllocator>,
-    ) -> Result<Tensor<T, N, WgpuAllocator>, WgpuError>
+    ) -> Result<GpuTensor<T, N>, WgpuError>
     where
         T: GpuElement,
     {
         let numel = src.shape.iter().product::<usize>();
-        let byte_size = (numel * std::mem::size_of::<T>()) as wgpu::BufferAddress;
+        let byte_size = (numel * std::mem::size_of::<T>()) as u64;
 
-        let device_arc = self.raw_device_arc();
-        let device = &device_arc.device;
-        let queue = &device_arc.queue;
+        let alloc = self.acquire_compute(byte_size);
+        self.raw_queue()
+            .write_buffer(alloc.gpu_buffer(), 0, bytemuck::cast_slice(src.as_slice()));
 
-        let gpu_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tensor Upload Buffer"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Safely cast the CPU slice to bytes and write it to the GPU
-        let cpu_slice = src.as_slice();
-        let bytes = bytemuck::cast_slice(cpu_slice);
-        queue.write_buffer(&gpu_buffer, 0, bytes);
-
-        // Wrap it in our GPU allocator
-        crate::transfer::wrap_gpu_tensor(src.shape, src.strides, gpu_buffer, device_arc.clone())
+        crate::transfer::wrap_gpu_tensor(src.shape, src.strides, alloc)
     }
 
-    /// Downloads a GPU Tensor back to the CPU
+    /// Download a GPU tensor to the CPU via the staging pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `src` - The GPU tensor to download.
+    ///
+    /// # Returns
+    ///
+    /// A new CPU tensor containing the downloaded data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WgpuError`] if mapping the underlying buffer fails.
     pub fn download_tensor<T, const N: usize>(
         &self,
-        src: &Tensor<T, N, WgpuAllocator>,
+        src: &GpuTensor<T, N>,
     ) -> Result<Tensor<T, N, CpuAllocator>, WgpuError>
     where
         T: GpuElement + Clone,
     {
-        let numel = src.shape.iter().product::<usize>();
-        let byte_size = (numel * std::mem::size_of::<T>()) as wgpu::BufferAddress;
+        let numel = src.shape().iter().product::<usize>();
+        let byte_size = (numel * std::mem::size_of::<T>()) as u64;
 
-        let gpu_buffer = crate::transfer::src_buffer_tensor(src);
+        let device = self.raw_device();
+        let queue = self.raw_queue();
+        let staging = self.staging_pool.acquire(device, byte_size);
 
-        let device_arc = self.raw_device_arc();
-        let device = &device_arc.device;
-        let queue = &device_arc.queue;
-
-        // Create a staging buffer on the CPU side to read into
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tensor Download Staging"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Copy from the GPU storage buffer to the staging buffer
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(gpu_buffer, 0, &staging_buffer, 0, byte_size);
-        queue.submit(std::iter::once(encoder.finish()));
+        encoder.copy_buffer_to_buffer(
+            crate::transfer::src_buffer_tensor(src),
+            0,
+            &staging,
+            0,
+            byte_size,
+        );
+        let submit_idx = queue.submit(std::iter::once(encoder.finish()));
 
-        // Map the buffer so the CPU can read it
-        let buffer_slice = staging_buffer.slice(..);
+        let slice = staging.slice(..byte_size);
         let (tx, rx) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
         });
-
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submit_idx),
+                timeout: None,
+            })
+            .unwrap();
         rx.recv().unwrap().map_err(WgpuError::MapFailed)?;
 
-        let mapped_view = buffer_slice.get_mapped_range();
-        let typed_slice: &[T] = bytemuck::cast_slice(&mapped_view);
-        let cpu_vec = typed_slice.to_vec();
+        let cpu_vec: Vec<T> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
 
-        drop(mapped_view);
-        staging_buffer.unmap();
+        staging.unmap();
+        self.staging_pool.release(staging);
 
-        Ok(Tensor::from_shape_vec(src.shape, cpu_vec, CpuAllocator).unwrap())
+        Ok(Tensor::from_shape_vec(src.0.shape, cpu_vec, CpuAllocator).unwrap())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::WgpuAllocator;
-    use kornia_tensor::TensorAllocator;
-    use std::alloc::Layout;
+    use crate::transfer::{image_to_cpu, image_to_gpu};
+    use kornia_image::{allocator::CpuAllocator, Image, ImageSize};
 
-    #[tokio::test]
-    async fn test_session_creation() {
-        let session = WgpuSession::new().await;
-        assert!(session.is_ok(), "Failed to create WgpuSession");
+    fn make_session() -> Option<WgpuSession> {
+        pollster::block_on(WgpuSession::new()).ok()
     }
 
-    #[tokio::test]
-    async fn test_allocator_fails_loudly() {
-        let session = WgpuSession::new().await.unwrap();
-
-        // Create a dummy buffer just to test the allocator
-        let buffer = session.raw_device().create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let cpu_backing = Arc::new(vec![0u8; 4_usize]);
-
-        let alloc = WgpuAllocator {
-            device: session.device.clone(),
-            gpu_buffer: std::sync::Arc::new(buffer),
-            cpu_backing,
+    fn test_image_4x4() -> Image<f32, 1, CpuAllocator> {
+        let size = ImageSize {
+            width: 4,
+            height: 4,
         };
+        Image::new(size, (0..16).map(|i| i as f32).collect(), CpuAllocator).unwrap()
+    }
 
-        let layout = Layout::from_size_align(4, 1).unwrap();
-        assert!(
-            alloc.alloc(layout).is_err(),
-            "Allocator should return an error"
+    #[test]
+    fn compute_pool_recycles_buffer() {
+        let Some(session) = make_session() else {
+            return;
+        };
+        let cpu = test_image_4x4();
+
+        let before = session.compute_pool.cached_count();
+
+        let gpu1 = image_to_gpu(&session, &cpu).unwrap();
+        assert_eq!(
+            session.compute_pool.cached_count(),
+            before,
+            "cached_count must not increase while buffer is in use"
         );
+
+        drop(gpu1);
+
+        assert_eq!(
+            session.compute_pool.cached_count(),
+            before + 1,
+            "cached_count must increase by 1 after Image is dropped"
+        );
+
+        let gpu2 = image_to_gpu(&session, &cpu).unwrap();
+        assert_eq!(
+            session.compute_pool.cached_count(),
+            before,
+            "cached_count must decrease by 1 when pool acquires again"
+        );
+
+        drop(gpu2);
+    }
+
+    #[test]
+    fn compute_pool_separate_size_classes() {
+        let Some(session) = make_session() else { return };
+
+        let small = Image::<f32, 1, _>::new(
+            ImageSize { width: 2, height: 2 }, vec![1.0f32; 4], CpuAllocator,
+        ).unwrap();
+        let large = Image::<f32, 1, _>::new(
+            ImageSize { width: 8, height: 8 }, vec![1.0f32; 64], CpuAllocator,
+        ).unwrap();
+
+        let gpu_s = image_to_gpu(&session, &small).unwrap();
+        let gpu_l = image_to_gpu(&session, &large).unwrap();
+
+        let ptr_s = crate::transfer::src_buffer(&gpu_s) as *const wgpu::Buffer;
+        let ptr_l = crate::transfer::src_buffer(&gpu_l) as *const wgpu::Buffer;
+
+        assert_ne!(ptr_s, ptr_l, "different size classes must not share a buffer");
+    }
+
+    #[test]
+    fn staging_pool_recycles_and_data_is_correct() {
+        let Some(session) = make_session() else {
+            return;
+        };
+        let cpu = test_image_4x4();
+        let gpu = image_to_gpu(&session, &cpu).unwrap();
+
+        let dl1 = image_to_cpu(&session, &gpu).unwrap();
+        assert_eq!(
+            dl1.as_slice(),
+            cpu.as_slice(),
+            "first download must be exact"
+        );
+
+        assert!(
+            session.staging_pool.cached_count() >= 1,
+            "staging pool must have reclaimed the buffer after download"
+        );
+
+        let dl2 = image_to_cpu(&session, &gpu).unwrap();
+        assert_eq!(
+            dl2.as_slice(),
+            cpu.as_slice(),
+            "second download via recycled buffer must be exact"
+        );
+    }
+
+    #[test]
+    fn staging_pool_overflow_still_works() {
+        let Some(session) = make_session() else {
+            return;
+        };
+        let cpu = test_image_4x4();
+        let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let gpu = image_to_gpu(&session, &cpu).unwrap();
+
+        for i in 0..5 {
+            let dl = image_to_cpu(&session, &gpu).unwrap();
+            assert_eq!(
+                dl.as_slice(),
+                data.as_slice(),
+                "download {i}: data corrupted"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_pool_respects_max_per_class() {
+        let Some(session) = make_session() else {
+            return;
+        };
+        let cpu = test_image_4x4();
+
+        let images: Vec<_> = (0..6)
+            .map(|_| image_to_gpu(&session, &cpu).unwrap())
+            .collect();
+        drop(images);
+
+        assert_eq!(
+            session.compute_pool.cached_count(),
+            4,
+            "pool must cap at max_per_class=4, not cache all 6"
+        );
+    }
+
+    #[test]
+    fn round_trip_preserves_pixels() {
+        let Some(session) = make_session() else {
+            return;
+        };
+        let numel = 32 * 32 * 3;
+        let data: Vec<f32> = (0..numel).map(|i| i as f32 / numel as f32).collect();
+        let cpu = Image::<f32, 3, _>::new(
+            ImageSize {
+                width: 32,
+                height: 32,
+            },
+            data.clone(),
+            CpuAllocator,
+        )
+        .unwrap();
+
+        let gpu = image_to_gpu(&session, &cpu).unwrap();
+        let dl = image_to_cpu(&session, &gpu).unwrap();
+
+        assert_eq!(dl.as_slice().len(), numel);
+        for (i, (got, expected)) in dl.as_slice().iter().zip(data.iter()).enumerate() {
+            assert_eq!(got, expected, "pixel {i} mismatch");
+        }
     }
 }

@@ -1,23 +1,10 @@
+//! Operations executable on the GPU (e.g., resizing, casting, elementwise ops).
+
 pub mod image;
 pub mod tensor;
 
 use crate::session::WgpuSession;
 use crate::shader::{PipelineKey, ShaderKind, WgslShader};
-
-/// Helper to quickly allocate an output storage buffer for a GPU image
-pub(crate) fn create_storage_buffer(
-    device: &wgpu::Device,
-    byte_size: wgpu::BufferAddress,
-) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Op Output Buffer"),
-        size: byte_size,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
 
 /// A generic dispatcher for operations that take 1 input buffer and write to 1 output buffer.
 #[allow(clippy::too_many_arguments)]

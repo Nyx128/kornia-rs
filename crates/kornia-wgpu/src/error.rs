@@ -1,3 +1,4 @@
+/// The main error type for the `kornia-wgpu` crate.
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
     #[error("No suitable GPU adapter found. Requested backend: {0:?}")]
@@ -26,7 +27,13 @@ pub enum WgpuError {
     InvalidSigma(f32),
 
     #[error("Shader compilation failed for {shader:?}: {msg}")]
-    ShaderCompilation { shader: String, msg: String }, // Using String for shader kind temporarily
+    ShaderCompilation { shader: String, msg: String },
+
+    #[error(
+        "attempted CPU slice access on a GPU-backed image or tensor; \
+         use transfer::image_to_cpu / session::download_tensor instead"
+    )]
+    CpuAccessOnGpuBuffer,
 
     #[error("Custom dispatch error: {0}")]
     Custom(String),

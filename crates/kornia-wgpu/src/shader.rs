@@ -115,9 +115,9 @@ shader_kind!(
     TENSOR_ELEMENTWISE,
     "TensorElementwise",
     [
-        binding!(0, Read, "array<f32>", "a"),
-        binding!(1, Read, "array<f32>", "b"),
-        binding!(2, Write, "array<f32>", "out"),
+        binding!(0, Read, "array<vec4<f32>>", "a"),
+        binding!(1, Read, "array<vec4<f32>>", "b"),
+        binding!(2, Write, "array<vec4<f32>>", "out"),
     ]
 );
 

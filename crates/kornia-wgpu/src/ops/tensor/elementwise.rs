@@ -1,35 +1,39 @@
-use crate::allocator::WgpuAllocator;
 use crate::error::WgpuError;
+use crate::gpu_res::GpuTensor;
 use crate::session::WgpuSession;
 use crate::shader::{PipelineKey, WgslShader, TENSOR_ELEMENTWISE};
-use kornia_tensor::Tensor;
+use crate::transfer::{acquire_output, src_buffer_tensor, wrap_gpu_tensor};
 
+/// Interoperability parameters for elementwise shaders.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ElemParams {
     pub numel: u32,
-    pub op_kind: u32, // 0=add, 1=sub, 2=mul, 3=div, ... 9=relu
+    pub op_kind: u32,
     pub _pad: [u32; 2],
 }
 
 const ELEMENTWISE_WGSL: &str = r#"
 struct Params {
-    numel: u32,
+    numel:   u32,  // original element count
     op_kind: u32,
-    _pad: vec2<u32>,
+    _pad:    vec2<u32>,
 }
 var<immediate> p: Params;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if i >= p.numel { return; }
+
+    // Each thread handles 4 elements. Stop when we've covered all vec4 slots.
+    // numel is the original count — div_ceil(numel, 4) is the number of vec4s.
+    let vec4_count = (p.numel + 3u) / 4u;
+    if i >= vec4_count { return; }
 
     let av = a[i];
     let bv = b[i];
-    
-    var res: f32 = av;
-    
+    var res: vec4<f32>;
+
     switch p.op_kind {
         case 0u: { res = av + bv; }
         case 1u: { res = av - bv; }
@@ -40,10 +44,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 6u: { res = sqrt(av); }
         case 7u: { res = exp(av); }
         case 8u: { res = log(av); }
-        case 9u: { res = max(0.0, av); } // ReLU
+        case 9u: { res = max(vec4(0.0), av); }
         default: { res = av; }
     }
-    
+
     out[i] = res;
 }
 "#;
@@ -65,19 +69,14 @@ fn compute_tensor_elementwise(
         kind: TENSOR_ELEMENTWISE.clone(),
         source: ELEMENTWISE_WGSL.to_string(),
     };
-    shader.build(); // now injects a, b, out declarations from bindings()
+    shader.build();
 
-    let pipeline = device_arc.get_or_create_pipeline(
-        key,
-        &shader,
-        std::mem::size_of::<ElemParams>() as u32,
-        // no bgl_entries argument
-    );
+    let pipeline =
+        device_arc.get_or_create_pipeline(key, &shader, std::mem::size_of::<ElemParams>() as u32);
 
-    let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Elementwise Bind Group"),
-        layout: &bind_group_layout,
+        label: Some("elementwise"),
+        layout: &pipeline.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -104,58 +103,87 @@ fn compute_tensor_elementwise(
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_immediates(0, bytemuck::bytes_of(params));
-
-        let wg_x = params.numel.div_ceil(64);
-        cpass.dispatch_workgroups(wg_x, 1, 1);
+        cpass.dispatch_workgroups(params.numel.div_ceil(256), 1, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));
 }
 
+/// Adds two GPU tensors elementwise.
+///
+/// # Arguments
+///
+/// * `session` - The active `WgpuSession`.
+/// * `a` - The first input tensor.
+/// * `b` - The second input tensor.
+///
+/// # Returns
+///
+/// A new [`GpuTensor`] containing the elementwise sum.
+///
+/// # Errors
+///
+/// Can return a [`WgpuError`] if buffer allocation fails.
 pub fn add<const N: usize>(
     session: &WgpuSession,
-    a: &Tensor<f32, N, WgpuAllocator>,
-    b: &Tensor<f32, N, WgpuAllocator>,
-) -> Result<Tensor<f32, N, WgpuAllocator>, WgpuError> {
-    let numel = a.shape.iter().product::<usize>() as u32;
-    let byte_size = (numel as usize * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
-    let out_buffer = crate::ops::create_storage_buffer(session.raw_device(), byte_size);
+    a: &GpuTensor<f32, N>,
+    b: &GpuTensor<f32, N>,
+) -> Result<GpuTensor<f32, N>, WgpuError> {
+    let numel = a.shape().iter().product::<usize>() as u32;
+    let byte_size = (numel as u64) * 4;
+    let byte_size_pad = (byte_size + 15) & !15; // align to vec4
+    let out_alloc = acquire_output(session, byte_size_pad);
 
-    let params = ElemParams {
-        numel,
-        op_kind: 0,
-        _pad: [0, 0],
-    }; // 0 = add
+    compute_tensor_elementwise(
+        session,
+        src_buffer_tensor(a),
+        src_buffer_tensor(b),
+        out_alloc.gpu_buffer(),
+        &ElemParams {
+            numel,
+            op_kind: 0,
+            _pad: [0, 0],
+        },
+    );
 
-    // Extract raw wgpu::Buffer from TensorStorage (assuming you have a helper for this like in images)
-    let buf_a = crate::transfer::src_buffer_tensor(a);
-    let buf_b = crate::transfer::src_buffer_tensor(b);
-
-    compute_tensor_elementwise(session, buf_a, buf_b, &out_buffer, &params);
-
-    crate::transfer::wrap_gpu_tensor(a.shape, a.strides, out_buffer, session.raw_device_arc())
+    wrap_gpu_tensor(a.0.shape, a.0.strides, out_alloc)
 }
 
-/// Applies the Rectified Linear Unit function (Unary)
+/// Applies the Rectified Linear Unit (ReLU) activation function elementwise.
+///
+/// # Arguments
+///
+/// * `session` - The active `WgpuSession`.
+/// * `a` - The input tensor.
+///
+/// # Returns
+///
+/// A new [`GpuTensor`] containing the activated values.
+///
+/// # Errors
+///
+/// Can return a [`WgpuError`] if buffer allocation fails.
 pub fn relu<const N: usize>(
     session: &WgpuSession,
-    a: &Tensor<f32, N, WgpuAllocator>,
-) -> Result<Tensor<f32, N, WgpuAllocator>, WgpuError> {
-    let numel = a.shape.iter().product::<usize>() as u32;
-    let byte_size = (numel as usize * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
-    let out_buffer = crate::ops::create_storage_buffer(session.raw_device(), byte_size);
+    a: &GpuTensor<f32, N>,
+) -> Result<GpuTensor<f32, N>, WgpuError> {
+    let numel = a.shape().iter().product::<usize>() as u32;
+    let byte_size = (numel as u64) * 4;
+    let byte_size_pad = (byte_size + 15) & !15;
+    let out_alloc = acquire_output(session, byte_size_pad);
 
-    let params = ElemParams {
-        numel,
-        op_kind: 9,
-        _pad: [0, 0],
-    }; // 9 = relu
+    compute_tensor_elementwise(
+        session,
+        src_buffer_tensor(a),
+        src_buffer_tensor(a),
+        out_alloc.gpu_buffer(),
+        &ElemParams {
+            numel,
+            op_kind: 9,
+            _pad: [0, 0],
+        },
+    );
 
-    let buf_a = crate::transfer::src_buffer_tensor(a);
-
-    // For unary, we safely pass `buf_a` as both inputs. The shader ignores `b`.
-    compute_tensor_elementwise(session, buf_a, buf_a, &out_buffer, &params);
-
-    crate::transfer::wrap_gpu_tensor(a.shape, a.strides, out_buffer, session.raw_device_arc())
+    wrap_gpu_tensor(a.0.shape, a.0.strides, out_alloc)
 }
 
 #[cfg(test)]
@@ -165,57 +193,23 @@ mod tests {
 
     #[test]
     fn test_tensor_add_and_relu_e2e() {
-        // Initialize the GPU Session
-        let session = pollster::block_on(WgpuSession::new()).expect("Failed to init WgpuSession");
+        let session = pollster::block_on(WgpuSession::new()).unwrap();
 
-        // Create standard CPU Tensors
         let shape = [2, 2];
+        let cpu_a =
+            Tensor::from_shape_vec(shape, vec![1.0f32, -20.0, 3.0, -50.0], CpuAllocator).unwrap();
+        let cpu_b =
+            Tensor::from_shape_vec(shape, vec![10.0f32, 5.0, 30.0, 10.0], CpuAllocator).unwrap();
 
-        // We will add these two.
-        // 1.0 + 10.0 = 11.0
-        // -20.0 + 5.0 = -15.0 (Should become 0.0 after ReLU)
-        // 3.0 + 30.0 = 33.0
-        // -50.0 + 10.0 = -40.0 (Should become 0.0 after ReLU)
-        let data_a = vec![1.0f32, -20.0, 3.0, -50.0];
-        let data_b = vec![10.0f32, 5.0, 30.0, 10.0];
+        let gpu_a = session.upload_tensor(&cpu_a).unwrap();
+        let gpu_b = session.upload_tensor(&cpu_b).unwrap();
+        let gpu_sum = add(&session, &gpu_a, &gpu_b).unwrap();
+        let gpu_relu = relu(&session, &gpu_sum).unwrap();
 
-        let cpu_a = Tensor::from_shape_vec(shape, data_a, CpuAllocator).unwrap();
-        let cpu_b = Tensor::from_shape_vec(shape, data_b, CpuAllocator).unwrap();
+        let cpu_sum = session.download_tensor(&gpu_sum).unwrap();
+        let cpu_relu = session.download_tensor(&gpu_relu).unwrap();
 
-        // Upload to GPU
-        let gpu_a = session
-            .upload_tensor(&cpu_a)
-            .expect("Failed to upload tensor A");
-        let gpu_b = session
-            .upload_tensor(&cpu_b)
-            .expect("Failed to upload tensor B");
-
-        // Run Binary Math (Add)
-        let gpu_added = add(&session, &gpu_a, &gpu_b).expect("Add operation failed");
-
-        // Run Unary Math (ReLU) on the result of the Add
-        let gpu_relu = relu(&session, &gpu_added).expect("ReLU operation failed");
-
-        // Download results back to CPU
-        let cpu_added = session
-            .download_tensor(&gpu_added)
-            .expect("Failed to download Add result");
-        let cpu_relu = session
-            .download_tensor(&gpu_relu)
-            .expect("Failed to download ReLU result");
-
-        // Verify the Add operation
-        let added_slice = cpu_added.as_slice();
-        assert_eq!(added_slice[0], 11.0);
-        assert_eq!(added_slice[1], -15.0);
-        assert_eq!(added_slice[2], 33.0);
-        assert_eq!(added_slice[3], -40.0);
-
-        // Verify the ReLU operation (Negatives should be 0.0)
-        let relu_slice = cpu_relu.as_slice();
-        assert_eq!(relu_slice[0], 11.0);
-        assert_eq!(relu_slice[1], 0.0);
-        assert_eq!(relu_slice[2], 33.0);
-        assert_eq!(relu_slice[3], 0.0);
+        assert_eq!(cpu_sum.as_slice(), &[11.0, -15.0, 33.0, -40.0]);
+        assert_eq!(cpu_relu.as_slice(), &[11.0, 0.0, 33.0, 0.0]);
     }
 }
