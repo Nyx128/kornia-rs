@@ -10,36 +10,6 @@ repository = { workspace = true }
 license = { workspace = true }
 include = { workspace = true }
 
-[dependencies]
-kornia-tensor = { workspace = true }
-kornia-image  = { workspace = true }
-kornia-imgproc = {workspace =true}
-kornia-io = {workspace = true, features=["gstreamer"]}
-wgpu     = { version = "28", features = ["wgsl"] }
-bytemuck = { version = "1",  features = ["derive"] }
-thiserror = { workspace = true }
-half = { version = "2", features = ["bytemuck"], optional = true }
-naga = { version = "28", optional = true }
-pollster = "0.3"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-kornia-io = { workspace = true }
-criterion = { workspace = true }
-
-[features]
-default          = []
-profiling        = []
-naga-validation  = ["dep:naga"]
-
-[[bench]]
-name = "bench_resize"
-harness = false
-
-[[bench]]
-name = "bench_tensor_ops"
-harness = false
-
 [[example]]
 name = "image_ops"
 path = "examples/image_ops.rs"
@@ -55,3 +25,33 @@ path = "examples/pipeline.rs"
 [[example]]
 name = "video_pipeline"
 path = "examples/video_pipeline.rs"
+
+[[bench]]
+harness = false
+name = "bench_resize"
+
+[[bench]]
+harness = false
+name = "bench_tensor_ops"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"], optional = true }
+kornia-image = { workspace = true }
+kornia-imgproc = { workspace = true }
+kornia-io = { workspace = true, features = ["gstreamer"] }
+kornia-tensor = { workspace = true }
+naga = { version = "28", optional = true }
+pollster = "0.3"
+thiserror = { workspace = true }
+wgpu = { version = "28", features = ["wgsl"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+kornia-io = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+naga-validation = ["dep:naga"]
+profiling = []

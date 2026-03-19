@@ -1,4 +1,3 @@
-use crate::device::WgpuDevice;
 use crate::error::WgpuError;
 use crate::pool::BufferPool;
 use std::alloc::Layout;
@@ -23,14 +22,6 @@ impl PooledBufferGuard {
         Self {
             buffer: Some(buffer),
             pool: Some(pool),
-        }
-    }
-
-    /// Buffer with no pool — just dropped normally (VRAM freed by wgpu).
-    pub fn unowned(buffer: wgpu::Buffer) -> Self {
-        Self {
-            buffer: Some(buffer),
-            pool: None,
         }
     }
 
@@ -69,7 +60,6 @@ impl std::fmt::Debug for PooledBufferGuard {
 /// `WgpuAllocator::gpu_buffer()` via the transfer functions.
 #[derive(Clone, Debug)]
 pub struct WgpuAllocator {
-    pub(crate) device: Arc<WgpuDevice>,
     /// Shared guard. All clones of this allocator reference the same buffer.
     /// Pool release fires exactly once when the last clone drops.
     pub(crate) guard: Arc<PooledBufferGuard>,

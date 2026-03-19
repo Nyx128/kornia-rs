@@ -53,6 +53,8 @@ impl WgpuDevice {
             .await
             .map_err(|_| WgpuError::NoAdapter(options.backend))?;
 
+        let adapter_limits = adapter.limits();
+
         println!("Selected adapter: {:?}", adapter.get_info().name);
 
         let (device, queue) = adapter
@@ -60,17 +62,11 @@ impl WgpuDevice {
                 label: None,
                 required_features: wgpu::Features::IMMEDIATES,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                required_limits: wgpu::Limits {
-                    max_immediate_size: 128,
-                    ..wgpu::Limits::default()
-                },
+                required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
             })
             .await?;
-
-        let limits = device.limits();
-        println!("Device limits: {:?}", limits.max_immediate_size);
 
         Ok(Arc::new(Self {
             device,

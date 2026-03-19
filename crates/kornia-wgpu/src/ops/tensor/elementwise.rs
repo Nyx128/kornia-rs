@@ -10,20 +10,22 @@ use crate::transfer::{acquire_output, src_buffer_tensor, wrap_gpu_tensor};
 pub struct ElemParams {
     pub numel: u32,
     pub op_kind: u32,
-    pub _pad: [u32; 2],
+    pub dispatch_x: u32,
+    pub _pad: u32,
 }
 
 const ELEMENTWISE_WGSL: &str = r#"
 struct Params {
     numel:   u32,  // original element count
     op_kind: u32,
-    _pad:    vec2<u32>,
+    dispatch_x:u32,
+    _pad:    u32,
 }
 var<immediate> p: Params;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * p.dispatch_x * 256u;
 
     // Each thread handles 4 elements. Stop when we've covered all vec4 slots.
     // numel is the original count — div_ceil(numel, 4) is the number of vec4s.
@@ -57,7 +59,8 @@ fn compute_tensor_elementwise(
     in_a: &wgpu::Buffer,
     in_b: &wgpu::Buffer,
     out_buffer: &wgpu::Buffer,
-    params: &ElemParams,
+    numel: u32,
+    op_kind: u32,
 ) {
     let device_arc = session.raw_device_arc();
     let device = &device_arc.device;
@@ -70,6 +73,15 @@ fn compute_tensor_elementwise(
         source: ELEMENTWISE_WGSL.to_string(),
     };
     shader.build();
+
+    let (wg_x, wg_y) = compute_dispatch(numel);
+
+    let params = ElemParams {
+        numel,
+        dispatch_x: wg_x,
+        op_kind,
+        _pad: 0,
+    };
 
     let pipeline =
         device_arc.get_or_create_pipeline(key, &shader, std::mem::size_of::<ElemParams>() as u32);
@@ -102,10 +114,25 @@ fn compute_tensor_elementwise(
         });
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.set_immediates(0, bytemuck::bytes_of(params));
-        cpass.dispatch_workgroups(params.numel.div_ceil(256), 1, 1);
+        cpass.set_immediates(0, bytemuck::bytes_of(&params));
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));
+}
+
+fn compute_dispatch(numel: u32) -> (u32, u32) {
+    const MAX_WG: u32 = 65535;
+    let vec4_count = numel.div_ceil(4);
+    let total_wg = vec4_count.div_ceil(256);
+
+    if total_wg <= MAX_WG {
+        (total_wg, 1)
+    } else {
+        // Spill into Y: find smallest Y such that X <= 65535
+        let wg_y = total_wg.div_ceil(MAX_WG);
+        let wg_x = total_wg.div_ceil(wg_y);
+        (wg_x, wg_y)
+    }
 }
 
 /// Adds two GPU tensors elementwise.
@@ -138,11 +165,8 @@ pub fn add<const N: usize>(
         src_buffer_tensor(a),
         src_buffer_tensor(b),
         out_alloc.gpu_buffer(),
-        &ElemParams {
-            numel,
-            op_kind: 0,
-            _pad: [0, 0],
-        },
+        numel,
+        0, // op_kind 0 = add
     );
 
     wrap_gpu_tensor(a.0.shape, a.0.strides, out_alloc)
@@ -176,11 +200,8 @@ pub fn relu<const N: usize>(
         src_buffer_tensor(a),
         src_buffer_tensor(a),
         out_alloc.gpu_buffer(),
-        &ElemParams {
-            numel,
-            op_kind: 9,
-            _pad: [0, 0],
-        },
+        numel,
+        9, // op_kind 9 = relu
     );
 
     wrap_gpu_tensor(a.0.shape, a.0.strides, out_alloc)

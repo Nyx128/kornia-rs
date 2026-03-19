@@ -84,7 +84,6 @@ impl WgpuSession {
     pub(crate) fn acquire_compute(&self, byte_size: u64) -> WgpuAllocator {
         let buffer = self.compute_pool.acquire(self.raw_device(), byte_size);
         WgpuAllocator {
-            device: self.device.clone(),
             guard: Arc::new(PooledBufferGuard::pooled(buffer, self.compute_pool.clone())),
         }
     }
@@ -233,14 +232,28 @@ mod tests {
 
     #[test]
     fn compute_pool_separate_size_classes() {
-        let Some(session) = make_session() else { return };
+        let Some(session) = make_session() else {
+            return;
+        };
 
         let small = Image::<f32, 1, _>::new(
-            ImageSize { width: 2, height: 2 }, vec![1.0f32; 4], CpuAllocator,
-        ).unwrap();
+            ImageSize {
+                width: 2,
+                height: 2,
+            },
+            vec![1.0f32; 4],
+            CpuAllocator,
+        )
+        .unwrap();
         let large = Image::<f32, 1, _>::new(
-            ImageSize { width: 8, height: 8 }, vec![1.0f32; 64], CpuAllocator,
-        ).unwrap();
+            ImageSize {
+                width: 8,
+                height: 8,
+            },
+            vec![1.0f32; 64],
+            CpuAllocator,
+        )
+        .unwrap();
 
         let gpu_s = image_to_gpu(&session, &small).unwrap();
         let gpu_l = image_to_gpu(&session, &large).unwrap();
@@ -248,7 +261,10 @@ mod tests {
         let ptr_s = crate::transfer::src_buffer(&gpu_s) as *const wgpu::Buffer;
         let ptr_l = crate::transfer::src_buffer(&gpu_l) as *const wgpu::Buffer;
 
-        assert_ne!(ptr_s, ptr_l, "different size classes must not share a buffer");
+        assert_ne!(
+            ptr_s, ptr_l,
+            "different size classes must not share a buffer"
+        );
     }
 
     #[test]
