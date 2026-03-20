@@ -6,6 +6,7 @@ This crate is a prototype and GSoC proposal for introducing a lightweight, porta
 
 [Google Docs proposal](https://docs.google.com/document/d/1f9y_QCpjZI-XzioxuNEmyO0uMCO2iC9Z4pjMTrP8GLY/edit?usp=sharing)
 
+#### For the maintainers: feel free to comment any suggestions and improvements, in case there are some inconsistencies.
 ---
 
 ## Synopsis
@@ -13,6 +14,8 @@ This crate is a prototype and GSoC proposal for introducing a lightweight, porta
 Kornia-RS currently relies on CPU-bound operations. `kornia-wgpu` implements `ops::image` and `ops::tensor` modules to enable high-performance spatial image processing and multidimensional tensor math.
 
 Built entirely on safe Rust abstractions, it uses `wgpu` (v28.0.0) to provide a portable GPU compute backend across Vulkan, Metal, DX12, and WebGL — preserving Kornia-RS's lightweight philosophy by avoiding heavyweight dependencies like CUDA or BLAS.
+
+**Why wgpu over CubeCL?** `wgpu` targets Vulkan, Metal, DX12, and WebGL from a single codebase, while CubeCL primarily targets CUDA and ROCm — introducing a hard CUDA dependency that contradicts kornia-rs's lightweight philosophy. CubeCL is also still in early development with a frequently changing API and sparse documentation, making it a poor foundation for a stable library. `wgpu` is mature, well-documented, and requires no external toolchain beyond the GPU drivers already present on the target platform.
 
 ---
 
@@ -48,7 +51,7 @@ flowchart TB
 
     subgraph OPS["  Ops layer  "]
         OI["ops::image
-        resize · cast_u8_to_f32 · grayscale · flip · normalize · filters"]:::ops
+        resize · cast_u8_to_f32 · grayscale · flip · normalize · filters · warp"]:::ops
         OT["ops::tensor
         elementwise · reductions · activations · matmul"]:::ops
     end
@@ -250,15 +253,18 @@ All measurements on RTX 4060 Laptop GPU. "GPU compute only" excludes PCIe transf
 - Flip
 - Normalize
 - Filters: box, Gaussian, Sobel
+- `perspective_warp_gpu` — homography warp kernel contributed to `ops::image::warp`; key deliverable for the Bubbaloop bird's-eye view demo
 
 ### Tensor operations (`ops::tensor`)
 - Elementwise math: `add`, `sub`, `mul`, `div`
 - Activations: `relu`, `exp`, `log`, `abs`
 - Reductions: `sum`, `mean`, `min`, `max`
+- Stride-aware indexing for non-contiguous tensors (rank-4 NCHW)
+- Tiled matrix multiplication with `var<workgroup>` shared memory
 
 ### Stretch goals
-- Batched matrix multiplication
-- Perspective warp / homography
+- Batched matrix multiplication (Z-dimension parallelism)
+- Kernel fusion API: lazy `Expr` tree, WGSL codegen, `session.eval()` for elementwise chains
 - Texture-based image pipelines
 
 ---
