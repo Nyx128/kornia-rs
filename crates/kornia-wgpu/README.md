@@ -34,6 +34,10 @@ Built entirely on safe Rust abstractions, it uses `wgpu` (v28.0.0) to provide a 
 
 **Native u8 support.** The `cast_u8_to_f32_gpu` kernel uploads raw u8 frames directly and divides by 255 in the shader — eliminating the CPU cast bottleneck.
 
+**Run Anywhere** wgpu's llvm_pipe software backend provides a production-grade CPU execution path — the same WGSL shaders run unchanged, with no mocking or test-only codepaths. Correctness tests, pool lifecycle tests, and buffer round-trip tests all pass on a standard GitHub Actions runner with no GPU present.
+
+Performance benchmarks require a real GPU; llvm_pipe is not representative of hardware throughput as it runs on the CPU.
+
 ---
 
 ## Architecture
@@ -194,6 +198,38 @@ After the first frame, both the compute buffer (VRAM) and the staging buffer (MA
 ```bash
 cargo run --example video_pipeline --features gstreamer -- <rtsp-url>
 ```
+
+A double-buffered async pipeline will be explored for the video node, overlapping PCIe upload of frame N+1 with GPU compute of frame N using map_async and a buffer ring drawn from the existing pool. This targets sustained throughput rather than single-frame latency.
+
+## Benchmarks
+
+All measurements on RTX 4060 Laptop GPU. "GPU compute only" excludes PCIe transfer time. CPU: AMD Ryzen 7 8845HS
+
+| Operation | GPU compute only | CPU (kornia native) | Speedup |
+|-----------|-----------------|---------------------|---------|
+| bilinear resize 1ch 2160p→1080p | 272 µs | 6.46 ms | ~24× |
+| bilinear resize 3ch 2160p→1080p | 632 µs | 9.74 ms | ~15× |
+| bilinear resize 3ch 720p→1080p | 244 µs | 9.23 ms | ~38× |
+| add [1024×1024] | 80 µs | 176 µs | ~2.2× |
+| add 64× [1024×1024] sequential | 11.2 ms | 29.1 ms | ~2.6× |
+| add flat [64×1024×1024] | 3.67 ms | 40.0 ms | ~10.9× |
+| relu flat [64×1024×1024] | 2.55 ms | 29.8 ms | ~11.7× |
+| add→relu chained flat [64×1024×1024] | 5.23 ms | 39.4 ms | ~7.5× |
+| bilinear resize 3ch 2160p→1080p *(texture sampler, planned)* | ~100–200 µs est. | 9.74 ms | ~50–100× est. |
+
+> Texture sampler resize is a planned optimisation. Hardware bilinear units handle interpolation natively, typically yielding a 3–5× improvement over the current storage buffer shader for the same workload.
+
+> Where operations involve spatially-local sampling — resize, perspective warp, and separable filters — the implementation will use wgpu texture bindings rather than storage buffers, delegating bilinear interpolation and boundary handling to dedicated hardware texture units. This is the primary planned optimisation beyond the current prototype.
+
+## vs cubecl benchmarks
+
+| Operation | kornia-wgpu | CubeCL (16×16) | speedup | tex. sampler (planned) |
+|---|---|---|---|---|
+| bilinear 1ch 2160p→1080p | **272 µs** | 703 µs | ~2.6× | ~100 µs est. |
+| bilinear 3ch 2160p→1080p | **632 µs** | 1113 µs | ~1.8× | ~200 µs est. |
+| bilinear 3ch 720p→1080p | **244 µs** | 801 µs | ~3.3× | ~100 µs est. |
+
+> GPU compute only, no PCIe transfer. RTX 4060 Laptop GPU. The CubeCL implementation uses 16×16 workgroups and vec4 vectorisation — the maximum optimisation possible within CubeCL's API. The remaining 1.8–3.3× gap is structural: CubeCL's JIT IR layer adds dispatch overhead that cannot be eliminated, and its compute-only model has no access to hardware texture units (TMUs). Texture sampler resize (planned for kornia-wgpu) is expected to widen this gap further.
 
 ---
 
