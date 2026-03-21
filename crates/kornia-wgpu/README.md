@@ -276,6 +276,7 @@ An equivalent bilinear resize was implemented in CubeCL (`WgpuRuntime`) using 16
 For elementwise ops like relu the gap narrows to ~1.3× (kornia-wgpu: 2.55 ms vs CubeCL: 3.40 ms at 64×1024×1024) since neither implementation has a spatial sampling advantage. The remaining difference is purely CubeCL's fixed JIT dispatch overhead. This confirms the gap is workload-dependent : largest where spatial sampling is involved, smallest for pure elementwise ops.
 
 ---
+✅-already implemented
 
 ## Roadmap (GSoC deliverables)
 
@@ -288,8 +289,8 @@ For elementwise ops like relu the gap narrows to ~1.3× (kornia-wgpu: 2.55 ms vs
 - `bytemuck` transfers: Pod-guaranteed safe byte casts at every CPU↔GPU boundary
 
 ### Image operations (`ops::image`)
-- Cast and scale: `cast_u8_to_f32_gpu`  : GPU kernel, eliminates CPU cast bottleneck, bit-packs u8 into u32 to work around WGSL's lack of native u8 storage
-- Resize: nearest-neighbour , bilinear  (single and multi-channel)
+- Cast and scale: `cast_u8_to_f32_gpu`✅  : GPU kernel, eliminates CPU cast bottleneck, bit-packs u8 into u32 to work around WGSL's lack of native u8 storage
+- Resize: nearest-neighbour✅ , bilinear✅  (single and multi-channel)
 - Grayscale
 - Flip
 - Normalize
@@ -297,8 +298,8 @@ For elementwise ops like relu the gap narrows to ~1.3× (kornia-wgpu: 2.55 ms vs
 - `perspective_warp_gpu` : homography warp kernel contributed to `ops::image::warp`; key deliverable for the Bubbaloop bird's-eye view demo
 
 ### Tensor operations (`ops::tensor`)
-- Elementwise math: `add` , `sub` , `mul` , `div`  : vec4 vectorised
-- Activations: `relu` , `exp` , `log` , `abs`  : vec4 vectorised
+- ✅Elementwise math: `add` , `sub` , `mul` , `div`  : vec4 vectorised
+- ✅Activations: `relu` , `exp` , `log` , `abs`  : vec4 vectorised
 - Reductions: `sum`, `mean`, `min`, `max` : two-pass parallel reduction for large tensors
 - Stride-aware indexing for non-contiguous tensors (rank-4 NCHW) : fast-path dispatch when `is_contiguous()`, stride-aware WGSL variant otherwise
 - Tiled matrix multiplication with `var<workgroup>` shared memory : improves arithmetic intensity, reduces global memory bandwidth
@@ -459,5 +460,13 @@ Beyond CPU-bound SIMD optimizations, my core technical expertise lies in GPU com
 Between my background in Mathematics and Scientific Computing, my prior PRs optimizing Kornia-RS, and my domain expertise in wgpu compute pipelines, I look forward to delivering this project in the coming summer. I am actively discussing this proposal with Kornia maintainers to ensure alignment with project goals.
 
 ---
+
+#### Skillsets I have that might come in handy here:
+- RenderDoc and NVIDIA Nsight for GPU pipeline inspection, shader debugging, and dispatch-level bottleneck analysis
+
+- Comfortable reading `x86 assembly` — useful for verifying SIMD codegen and compiler output rather than trusting it blindly
+
+- Experience with Rust's `perf`, `cargo-flamegraph`, and `Criterion` for CPU-side profiling and regression tracking
+
 
 Authored by Neelabhro Ghosh ([@Nyx128](https://github.com/Nyx128)) ;)
