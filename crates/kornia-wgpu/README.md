@@ -432,6 +432,17 @@ Each phase includes continuous benchmarking against CPU implementations to ensur
 
 ---
 
+## Availability
+- I happen to have summer break for the almost the entiriety of the coding period, so I can give **35 hours** per week of time to my project.
+
+- I will be online on Discord daily, weekly meetings are also good.
+
+- I can communicate on any platform preffered by the maintainers(Discord, Github, Mail, Slack, etc..)
+
+- Timezone: **UTC+5:30**. But really you can reach me at almost any time of the day, I'll try to respond as quickly as possible.
+
+---
+
 ## About Me
 
 **Name:** Neelabhro Ghosh
