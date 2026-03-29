@@ -45,6 +45,8 @@ naga = { version = "28", optional = true }
 pollster = "0.3"
 thiserror = { workspace = true }
 wgpu = { version = "28", features = ["wgsl"] }
+gstreamer = "0.22"
+gstreamer-app = "0.22"
 
 [dev-dependencies]
 criterion = { workspace = true }

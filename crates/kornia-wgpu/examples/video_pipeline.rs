@@ -1,26 +1,18 @@
 //! examples/video_pipeline.rs
 //!
-//! Live video pipeline: grab 720p H.265 frames from an RTSP stream,
-//! upscale each frame to 1080p on the GPU using bilinear resize.
-//!
-//! Pipeline per frame:
-//!   RTSP H.265 720p RGB frame (u8, GstAllocator)
-//!     → cast_u8_to_f32_gpu   (GPU kernel, no intermediate Vec<f32>)
-//!     → resize_bilinear_f32  1280x720 → 1920x1080
-//!     → image_to_cpu         (PCIe download)
-//!
-//! Only ONE PCIe upload crossing per frame — the u8 bytes go straight
-//! into the cast kernel's input buffer and never touch the CPU as f32.
-//!
-//! Run with:
-//!   cargo run --example video_pipeline --features gstreamer -- <rtsp-url>
+//! Live video pipeline: grab 720p frames from an RTSP stream,
+//! upscale each frame to 1080p on the GPU using bilinear resize,
+//! and display them in a live window using GStreamer autovideosink.
 
+use gstreamer::prelude::*;
 use kornia_image::ImageSize;
 use kornia_io::{fps_counter::FpsCounter, gstreamer::StreamCapture};
 use kornia_wgpu::{
     ops::image::cast::cast_u8_to_f32_gpu, ops::image::resize::resize_bilinear_f32,
     session::WgpuSession, transfer::image_to_cpu,
 };
+use std::sync::mpsc;
+use std::thread;
 
 const IN_W: usize = 1280;
 const IN_H: usize = 720;
@@ -28,6 +20,9 @@ const OUT_W: usize = 1920;
 const OUT_H: usize = 1080;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize GStreamer
+    gstreamer::init()?;
+
     let session = pollster::block_on(WgpuSession::new())?;
     println!("GPU session ready.");
     println!("Pipeline: {IN_W}x{IN_H} 720p -> {OUT_W}x{OUT_H} 1080p\n");
@@ -36,12 +31,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .expect("Usage: video_upscale_720p_to_1080p <rtsp-url>");
 
-    let pipeline_desc = format!(
-        "rtspsrc location={rtsp_url} latency=0 ! rtph265depay ! avdec_h265 ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink"
+    // --- Capture Pipeline ---
+    let capture_desc = format!(
+        "rtspsrc location={rtsp_url} protocols=tcp latency=200 ! decodebin ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink sync=false drop=true max-buffers=1"
     );
-    let mut capture = StreamCapture::new(&pipeline_desc)?;
+    let mut capture = StreamCapture::new(&capture_desc)?;
     capture.start()?;
-    println!("RTSP H.265 stream started: {rtsp_url}\n");
+    println!("RTSP stream started: {rtsp_url}\n");
+
+    // --- Display Pipeline ---
+    let display_desc = format!(
+        "appsrc name=src format=time is-live=true block=true \
+         caps=video/x-raw,format=RGB,width={},height={},framerate=30/1 ! \
+         videoconvert ! autovideosink sync=false",
+        OUT_W, OUT_H
+    );
+
+    let display_pipeline = gstreamer::parse::launch(&display_desc)?
+        .dynamic_cast::<gstreamer::Pipeline>()
+        .expect("Failed to cast to Pipeline");
+
+    let appsrc = display_pipeline
+        .by_name("src")
+        .expect("Failed to find appsrc")
+        .dynamic_cast::<gstreamer_app::AppSrc>()
+        .expect("Failed to cast to AppSrc");
+
+    display_pipeline.set_state(gstreamer::State::Playing)?;
+    println!("Live playback started. Press Ctrl+C to stop.");
+
+    // --- Thread Setup ---
+    let (tx, rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(5);
+    let appsrc_clone = appsrc.clone();
+
+    // Spawn the dedicated background thread for pushing buffers to the screen
+    let display_thread = thread::spawn(move || {
+        while let Ok((frame_idx, frame_data)) = rx.recv() {
+            let mut buffer = gstreamer::Buffer::from_mut_slice(frame_data);
+            
+            let pts = gstreamer::ClockTime::from_mseconds(frame_idx as u64 * 33);
+            buffer.get_mut().unwrap().set_pts(Some(pts));
+            
+            if appsrc_clone.push_buffer(buffer).is_err() {
+                eprintln!("Failed to push buffer to GStreamer display. Window might have been closed.");
+                break;
+            }
+        }
+    });
 
     let out_size = ImageSize {
         width: OUT_W,
@@ -50,9 +86,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut fps_counter = FpsCounter::new();
     let mut frame_count = 0usize;
+    let mut total_process_us = 0u128;
     let mut total_cast_us = 0u128;
     let mut total_resize_us = 0u128;
     let mut total_download_us = 0u128;
+    let mut total_convert_us = 0u128;
 
     loop {
         let Some(frame) = capture.grab_rgb8()? else {
@@ -60,17 +98,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
 
-        frame_count += 1;
         fps_counter.update();
 
-        // The u8 bytes from GstAllocator go straight into a u32 storage buffer
-        // on the GPU. The shader unpacks each byte and divides by 255.
-        // Zero intermediate Vec<f32> on the CPU.
+        // Start total processing timer here
+        let t_process_start = std::time::Instant::now();
+
+        // GPU Processing
         let t0 = std::time::Instant::now();
         let gpu_f32 = cast_u8_to_f32_gpu(&session, &frame)?;
         total_cast_us += t0.elapsed().as_micros();
 
-        //Bilinear upscale 720p → 1080p (chained in VRAM)
         let t1 = std::time::Instant::now();
         let gpu_out = resize_bilinear_f32(&session, &gpu_f32, out_size)?;
         let _ = session
@@ -78,25 +115,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .poll(wgpu::PollType::wait_indefinitely());
         total_resize_us += t1.elapsed().as_micros();
 
-        //Download the final 1080p f32 image back to CPU
         let t2 = std::time::Instant::now();
-        let _cpu_out = image_to_cpu(&session, &gpu_out)?;
+        let cpu_out = image_to_cpu(&session, &gpu_out)?;
         total_download_us += t2.elapsed().as_micros();
 
-        if frame_count % 10 == 0 {
-            let n = 10u128;
+        // Track the CPU float-to-u8 conversion time
+        let t3 = std::time::Instant::now();
+        let u8_data: Vec<u8> = cpu_out
+            .as_slice()
+            .iter()
+            .map(|&val| (val * 255.0).clamp(0.0, 255.0) as u8)
+            .collect();
+        total_convert_us += t3.elapsed().as_micros();
+
+        // Stop total processing timer
+        total_process_us += t_process_start.elapsed().as_micros();
+
+        // Send to the display thread
+        if tx.send((frame_count, u8_data)).is_err() {
+            println!("Display window closed or thread disconnected. Exiting...");
+            break;
+        }
+
+        frame_count += 1;
+
+        if frame_count % 30 == 0 {
+            let n = 30u128;
             println!(
-                "Frame {:3}  fps={:5.1}  cast={:4}us  resize={:3}us  download={:4}us  total={:4}us",
+                "Frame {:4}  fps={:5.1}  total={:5}us | cast={:4}us  resize={:4}us  download={:4}us  convert={:5}us",
                 frame_count,
                 fps_counter.fps(),
+                total_process_us / n,
                 total_cast_us / n,
                 total_resize_us / n,
                 total_download_us / n,
-                (total_cast_us + total_resize_us + total_download_us) / n,
+                total_convert_us / n,
             );
+            total_process_us = 0;
             total_cast_us = 0;
             total_resize_us = 0;
             total_download_us = 0;
+            total_convert_us = 0;
         }
     }
+
+    // --- Graceful Teardown ---
+    drop(tx);
+    let _ = display_thread.join();
+    appsrc.end_of_stream()?;
+    
+    // Shut down the pipeline safely
+    display_pipeline.set_state(gstreamer::State::Null)?;
+    println!("Shutdown complete.");
+
+    Ok(())
 }
