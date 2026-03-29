@@ -8,6 +8,14 @@ use kornia_image::{Image, ImageSize};
 use kornia_tensor::storage::TensorStorage;
 use kornia_tensor::Tensor;
 
+/// wgpu requires all buffer copy sizes and offsets to be a multiple of 4.
+const COPY_ALIGNMENT: u64 = wgpu::COPY_BUFFER_ALIGNMENT; // = 4
+
+#[inline]
+fn align_up(n: u64) -> u64 {
+    (n + COPY_ALIGNMENT - 1) & !(COPY_ALIGNMENT - 1)
+}
+
 /// Wrap a `WgpuAllocator` into a `GpuImage`.
 ///
 /// SAFETY: `TensorStorage::ptr` is `NonNull::dangling()`. The inner Image
@@ -69,13 +77,20 @@ where
 {
     let size = cpu_image.size();
     let byte_size = (size.width * size.height * C * std::mem::size_of::<T>()) as u64;
+    let write_size = align_up(byte_size);
 
-    let alloc = session.acquire_compute(byte_size);
-    session.raw_queue().write_buffer(
-        alloc.gpu_buffer(),
-        0,
-        bytemuck::cast_slice(cpu_image.as_slice()),
-    );
+    // acquire_compute rounds up to next_power_of_two, so the buffer is always
+    // at least `write_size` bytes. We pad the CPU slice with zero bytes when
+    // the true payload is not a multiple of COPY_BUFFER_ALIGNMENT (4).
+    let alloc = session.acquire_compute(write_size);
+    let raw: &[u8] = bytemuck::cast_slice(cpu_image.as_slice());
+    if write_size == byte_size {
+        session.raw_queue().write_buffer(alloc.gpu_buffer(), 0, raw);
+    } else {
+        let mut padded = raw.to_vec();
+        padded.resize(write_size as usize, 0u8);
+        session.raw_queue().write_buffer(alloc.gpu_buffer(), 0, &padded);
+    }
 
     wrap_gpu_buffer(size, alloc)
 }
@@ -105,9 +120,17 @@ where
     let numel = size.width * size.height * C;
     let byte_size = (numel * std::mem::size_of::<T>()) as u64;
 
+    // wgpu requires copy sizes to be a multiple of COPY_BUFFER_ALIGNMENT (4).
+    // We request a staging buffer large enough for the aligned size, copy the
+    // aligned amount, then slice only the true `byte_size` bytes when reading
+    // back. The tail bytes in the padding region are defined (the pool buffer
+    // is zeroed on first allocation by the driver) but are never exposed to
+    // the caller.
+    let copy_size = align_up(byte_size);
+
     let device = session.raw_device();
     let queue = session.raw_queue();
-    let staging = session.staging_pool.acquire(device, byte_size);
+    let staging = session.staging_pool.acquire(device, copy_size);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("img-download"),
@@ -117,11 +140,12 @@ where
         0,
         &staging,
         0,
-        byte_size,
+        copy_size, // aligned — never triggers COPY_BUFFER_ALIGNMENT validation error
     );
     let submit_idx = queue.submit(std::iter::once(encoder.finish()));
 
-    let slice = staging.slice(..byte_size);
+    // Map only the true byte range; the padding tail is invisible to the caller.
+    let slice = staging.slice(..copy_size);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -134,7 +158,12 @@ where
         .unwrap();
     rx.recv().unwrap().map_err(WgpuError::MapFailed)?;
 
-    let data: Vec<T> = bytemuck::cast_slice::<u8, T>(&slice.get_mapped_range()).to_vec();
+    // Cast the full mapped range, then truncate to the true element count.
+    // This avoids a separate allocation: bytemuck::cast_slice is zero-copy,
+    // and to_vec() copies only what we ask it to.
+    let mapped = slice.get_mapped_range();
+    let data: Vec<T> = bytemuck::cast_slice::<u8, T>(&mapped[..byte_size as usize]).to_vec();
+    drop(mapped); // must drop before unmap
 
     staging.unmap();
     session.staging_pool.release(staging);
@@ -199,5 +228,34 @@ mod tests {
         let downloaded = image_to_cpu(&session, &gpu).expect("download failed");
 
         assert_eq!(original.as_slice(), downloaded.as_slice());
+    }
+
+    /// Specifically exercises a non-multiple-of-4 byte size to catch
+    /// COPY_BUFFER_ALIGNMENT regressions.
+    #[test]
+    fn test_gpu_round_trip_non_aligned() {
+        let session = pollster::block_on(WgpuSession::new()).unwrap();
+
+        // 3×1 u8 1-channel = 3 bytes — not aligned to 4
+        let size = ImageSize {
+            width: 3,
+            height: 1,
+        };
+        let original =
+            Image::<u8, 1, _>::new(size, vec![10u8, 20, 30], CpuAllocator).unwrap();
+        let gpu = image_to_gpu(&session, &original).expect("upload failed");
+        let downloaded = image_to_cpu(&session, &gpu).expect("download failed");
+        assert_eq!(original.as_slice(), downloaded.as_slice());
+
+        // 1×1 RGB f32 = 12 bytes — aligned, sanity check
+        let size2 = ImageSize {
+            width: 1,
+            height: 1,
+        };
+        let original2 =
+            Image::<f32, 3, _>::new(size2, vec![0.1f32, 0.5, 0.9], CpuAllocator).unwrap();
+        let gpu2 = image_to_gpu(&session, &original2).expect("upload failed");
+        let downloaded2 = image_to_cpu(&session, &gpu2).expect("download failed");
+        assert_eq!(original2.as_slice(), downloaded2.as_slice());
     }
 }

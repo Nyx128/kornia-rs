@@ -130,6 +130,23 @@ shader_kind!(
     ]
 );
 
+/// f32 → packed u8.
+///
+/// Binding 0: `array<f32>` — source f32 pixels (read).
+/// Binding 1: `array<u32>` — destination packed u8 bytes (write).
+///
+/// Each thread packs 4 consecutive f32 values into one u32 word using
+/// the WGSL `pack4x8unorm` built-in, which saturates, rounds, and packs
+/// in a single hardware instruction.
+shader_kind!(
+    CAST_F32_TO_U8,
+    "CastF32ToU8",
+    [
+        binding!(0, Read,  "array<f32>", "input_f32"),
+        binding!(1, Write, "array<u32>", "output_u8"),
+    ]
+);
+
 // ── Pipeline cache key ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
