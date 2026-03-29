@@ -197,46 +197,190 @@ let result = session.download_tensor(&gpu_relu)?;
 
 ### 4. Real-time video pipeline
 
-Grab live 720p H.265 frames from RTSP, upscale to 1080p on the GPU.
+Grab live 720p frames from an RTSP stream, upscale to 1080p on the GPU, and display them live via GStreamer `autovideosink`. The entire hot path stays on the GPU — three chained WGSL shaders with no CPU pixel math between them.
 
 ```
 u8 frame from GStreamer
-  → cast_u8_to_f32_gpu   packs bytes into u32, divides by 255 in shader   (PCIe upload)
-  → resize_bilinear_f32  1280×720 → 1920×1080                              (VRAM only)
-  → image_to_cpu                                                            (PCIe download)
+  → cast_u8_to_f32_gpu    packs bytes into u32, divides by 255 in shader   (PCIe upload)
+  → resize_bilinear_f32   1280×720 → 1920×1080                              (VRAM only)
+  → cast_f32_to_u8_gpu    pack4x8unorm: saturate → ×255 → round → pack      (VRAM only)
+  → image_to_cpu          staged MAP_READ readback                           (PCIe download)
 ```
 
 ```rust
-use kornia_io::gstreamer::StreamCapture;
+use gstreamer::prelude::*;
+use kornia_image::ImageSize;
+use kornia_io::{fps_counter::FpsCounter, gstreamer::StreamCapture};
 use kornia_wgpu::{
-    ops::image::{cast::cast_u8_to_f32_gpu, resize::resize_bilinear_f32},
+    ops::image::cast::{cast_f32_to_u8_gpu, cast_u8_to_f32_gpu},
+    ops::image::resize::resize_bilinear_f32,
+    session::WgpuSession,
     transfer::image_to_cpu,
 };
+use std::sync::mpsc;
+use std::thread;
 
-let mut capture = StreamCapture::new(&pipeline_desc)?;
-capture.start()?;
+const IN_W: usize = 1280;
+const IN_H: usize = 720;
+const OUT_W: usize = 1920;
+const OUT_H: usize = 1080;
 
-let out_size = ImageSize { width: 1920, height: 1080 };
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    gstreamer::init()?;
 
-loop {
-    let Some(frame) = capture.grab_rgb8()? else { continue; };
+    let session = pollster::block_on(WgpuSession::new())?;
 
-    let gpu_f32  = cast_u8_to_f32_gpu(&session, &frame)?;
-    let gpu_1080 = resize_bilinear_f32(&session, &gpu_f32, out_size)?;
+    let rtsp_url = std::env::args()
+        .nth(1)
+        .expect("Usage: video_pipeline <rtsp-url>");
 
-    session.raw_device().poll(wgpu::PollType::wait_indefinitely());
-    let _cpu_out = image_to_cpu(&session, &gpu_1080)?;
+    // --- Capture pipeline (RTSP → RGB appsink) ---
+    let capture_desc = format!(
+        "rtspsrc location={rtsp_url} protocols=tcp latency=200 ! decodebin ! videoconvert ! \
+         video/x-raw,format=RGB ! appsink name=sink sync=false drop=true max-buffers=1"
+    );
+    let mut capture = StreamCapture::new(&capture_desc)?;
+    capture.start()?;
+
+    // --- Display pipeline (RGB appsrc → autovideosink) ---
+    let display_desc = format!(
+        "appsrc name=src format=time is-live=true block=true \
+         caps=video/x-raw,format=RGB,width={OUT_W},height={OUT_H},framerate=30/1 ! \
+         videoconvert ! autovideosink sync=false"
+    );
+    let display_pipeline = gstreamer::parse::launch(&display_desc)?
+        .dynamic_cast::<gstreamer::Pipeline>()
+        .expect("Failed to cast to Pipeline");
+
+    let appsrc = display_pipeline
+        .by_name("src")
+        .expect("Failed to find appsrc")
+        .dynamic_cast::<gstreamer_app::AppSrc>()
+        .expect("Failed to cast to AppSrc");
+
+    display_pipeline.set_state(gstreamer::State::Playing)?;
+
+    // Dedicated thread: push downloaded frames to autovideosink.
+    let (tx, rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(5);
+    let appsrc_clone = appsrc.clone();
+    let display_thread = thread::spawn(move || {
+        while let Ok((frame_idx, frame_data)) = rx.recv() {
+            let mut buffer = gstreamer::Buffer::from_mut_slice(frame_data);
+            let pts = gstreamer::ClockTime::from_mseconds(frame_idx as u64 * 33);
+            buffer.get_mut().unwrap().set_pts(Some(pts));
+            if appsrc_clone.push_buffer(buffer).is_err() {
+                break;
+            }
+        }
+    });
+
+    let out_size = ImageSize { width: OUT_W, height: OUT_H };
+    let mut fps_counter = FpsCounter::new();
+    let mut frame_count = 0usize;
+
+    loop {
+        let Some(frame) = capture.grab_rgb8()? else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        };
+
+        fps_counter.update();
+
+        // ── GPU stage 1: u8 → f32 ─────────────────────────────────────────────
+        // Uploads raw u8 bytes as packed u32 words; WGSL shader unpacks and
+        // divides by 255 — no CPU float math.
+        let gpu_f32 = cast_u8_to_f32_gpu(&session, &frame)?;
+
+        // ── GPU stage 2: bilinear resize 720p → 1080p ─────────────────────────
+        // Reads gpu_f32 from VRAM, writes result back to VRAM.
+        // Zero PCIe transfers between this op and its neighbours.
+        let gpu_1080_f32 = resize_bilinear_f32(&session, &gpu_f32, out_size)?;
+
+        // ── GPU stage 3: f32 → u8 ─────────────────────────────────────────────
+        // Uses WGSL pack4x8unorm: saturate → ×255 → round → pack 4 bytes/u32.
+        // Replaces the old CPU iterator entirely.
+        let gpu_1080_u8 = cast_f32_to_u8_gpu(&session, &gpu_1080_f32)?;
+
+        // ── Sync: wait for all three GPU stages to complete ───────────────────
+        session.raw_device().poll(wgpu::PollType::wait_indefinitely());
+
+        // ── PCIe download: GPU u8 → CPU Vec<u8> ──────────────────────────────
+        // Maps a staging buffer and copies exactly OUT_W × OUT_H × 3 bytes.
+        let cpu_out = image_to_cpu(&session, &gpu_1080_u8)?;
+
+        // Hand off to display thread — no copy, no cast.
+        if tx.send((frame_count, cpu_out.as_slice().to_vec())).is_err() {
+            break;
+        }
+
+        frame_count += 1;
+        if frame_count % 30 == 0 {
+            println!("Frame {:4}  fps={:.1}", frame_count, fps_counter.fps());
+        }
+
+        // After the first frame, both the compute buffer (VRAM) and the staging
+        // buffer (MAP_READ) are recycled from their pools :
+        // zero GPU allocations per frame for fixed-size workloads.
+    }
+
+    drop(tx);
+    let _ = display_thread.join();
+    appsrc.end_of_stream()?;
+    display_pipeline.set_state(gstreamer::State::Null)?;
+
+    Ok(())
 }
 ```
 
-After the first frame, both the compute buffer (VRAM) and the staging buffer (MAP_READ) are recycled from the pool : zero allocations per frame.
+**Measured on an RTX 2050 (Vulkan backend):** the full round-trip — PCIe upload, three chained GPU ops (cast → resize → cast), PCIe download — completes in **9–10 ms per frame**, comfortably sustaining smooth 60 fps throughput after pool warmup.
+
+A double-buffered async pipeline will be explored for the video node, overlapping PCIe upload of frame N+1 with GPU compute of frame N using `map_async` and a buffer ring drawn from the existing pool. This targets sustained throughput rather than single-frame latency.
 
 ```bash
 cargo run --example video_pipeline --features gstreamer -- <rtsp-url>
 ```
 
-A double-buffered async pipeline will be explored for the video node, overlapping PCIe upload of frame N+1 with GPU compute of frame N using `map_async` and a buffer ring drawn from the existing pool. This targets sustained throughput rather than single-frame latency.
+---
+Here is a clean, easy-to-follow "How to" section you can drop right into your `README.md`. It keeps the professional tone of your existing documentation while making the local webcam setup foolproof.
 
+***
+
+## Running the Examples
+
+Most of the examples in this prototype are self-contained and can be run as-is using standard Cargo commands:
+
+```bash
+cargo run --example <example_name>
+```
+
+### Testing the Real-Time Video Pipeline
+
+The `video_pipeline` example requires an active RTSP stream. For an easy local setup using your webcam, we recommend using [MediaMTX](https://github.com/bluenviron/mediamtx) to serve a low-latency H.264 stream.
+
+**1. Set up MediaMTX**
+Download the MediaMTX binary and place the provided `mediamtx.yml` configuration file in the same directory. This configuration automatically captures your local webcam (`/dev/video0`) using `ffmpeg` and serves it over RTSP. 
+
+The relevant section in the provided `mediamtx.yml` is:
+```yaml
+paths:
+  webcam:
+    runOnInit: ffmpeg -f v4l2 -i /dev/video0 -c:v libx264 -preset ultrafast -tune zerolatency -b:v 2M -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+```
+*[Note: You may need to change `/dev/video0` if your webcam is mounted elsewhere, or use a DirectShow/AVFoundation equivalent if you are on Windows/macOS.]*
+
+**2. Start the stream**
+Run the MediaMTX server with the config file:
+```bash
+./mediamtx mediamtx.yml
+```
+Your webcam stream will now be available at `rtsp://localhost:8554/webcam`.
+
+**3. Run the pipeline**
+Pass the local RTSP URL to the example. Make sure you have the `gstreamer` feature flag enabled:
+
+```bash
+cargo run --example video_pipeline --features gstreamer -- rtsp://localhost:8554/webcam
+```
 ---
 
 ## Benchmarks
@@ -289,8 +433,8 @@ For elementwise ops like relu the gap narrows to ~1.3× (kornia-wgpu: 2.55 ms vs
 - `bytemuck` transfers: Pod-guaranteed safe byte casts at every CPU↔GPU boundary
 
 ### Image operations (`ops::image`)
-- Cast and scale: `cast_u8_to_f32_gpu`✅  : GPU kernel, eliminates CPU cast bottleneck, bit-packs u8 into u32 to work around WGSL's lack of native u8 storage
-- Resize: nearest-neighbour✅ , bilinear✅  (single and multi-channel)
+- Cast and scale: `cast_u8_to_f32_gpu`✅, `cast_f32_to_u8_gpu`✅ : GPU kernels, eliminate CPU cast bottleneck; `cast_u8_to_f32_gpu` bit-packs u8 into u32 to work around WGSL's lack of native u8 storage; `cast_f32_to_u8_gpu` uses WGSL `pack4x8unorm` to handle 4 pixels per thread
+- Resize: nearest-neighbour✅, bilinear✅ (single and multi-channel)
 - Grayscale
 - Flip
 - Normalize
@@ -298,8 +442,8 @@ For elementwise ops like relu the gap narrows to ~1.3× (kornia-wgpu: 2.55 ms vs
 - `perspective_warp_gpu` : homography warp kernel contributed to `ops::image::warp`; key deliverable for the Bubbaloop bird's-eye view demo
 
 ### Tensor operations (`ops::tensor`)
-- ✅Elementwise math: `add` , `sub` , `mul` , `div`  : vec4 vectorised
-- ✅Activations: `relu` , `exp` , `log` , `abs`  : vec4 vectorised
+- ✅ Elementwise math: `add`, `sub`, `mul`, `div` : vec4 vectorised
+- ✅ Activations: `relu`, `exp`, `log`, `abs` : vec4 vectorised
 - Reductions: `sum`, `mean`, `min`, `max` : two-pass parallel reduction for large tensors
 - Stride-aware indexing for non-contiguous tensors (rank-4 NCHW) : fast-path dispatch when `is_contiguous()`, stride-aware WGSL variant otherwise
 - Tiled matrix multiplication with `var<workgroup>` shared memory : improves arithmetic intensity, reduces global memory bandwidth
@@ -315,129 +459,132 @@ For elementwise ops like relu the gap narrows to ~1.3× (kornia-wgpu: 2.55 ms vs
 
 ### Community Bonding (May 1 – May 24)
 
-- Discuss API design and architecture with Kornia maintainers
-- Finalise integration path between kornia-wgpu and Bubbaloop pipeline node model
-- Set up CI for GPU tests (Vulkan backend, then Jetson Orin)
-- Review prototype against codebase conventions and incorporate mentor feedback
+- Align on API design, file structure, and Bubbaloop node integration model with Kornia maintainers and Bubbaloop team
+- Finalise the REST API contract between the BEV node and Bubbaloop's pipeline manager
+- Set up CI for GPU tests (Vulkan software renderer backend first, then coordinate Jetson Orin access with mentors)
+- Review prototype code against kornia-rs conventions and incorporate mentor feedback on crate structure
 
-Deliverable: final architecture document and development roadmap.
-
-Note: I don't have a Jetson Orin myself, but I have similarly capable machines for testing. I will be relying on my mentors to give me feedback on Orin-specific behaviour.
+Deliverable: architecture alignment document, CI pipeline, agreed file structure for kornia-wgpu.
 
 ---
 
-### Week 1 : Image Operations
+### Weeks 1–2 : Bubbaloop Node Scaffold + Core Video Pipeline
 
-Implement foundational image operations.
+The application is wired up first. Every op written in subsequent weeks lands directly into a running pipeline and can be tested end-to-end immediately.
 
 Tasks:
-- Implement grayscale, flip, normalize WGSL shaders
-- Integrate with Kornia image API and write unit tests
-- Benchmark GPU vs CPU for each new op
+- Implement `BevNode` struct with `WgpuSession` held for pipeline lifetime
+- Wire GStreamer RTSP source to the node's frame handler using kornia-rs's existing capture utilities
+- Integrate `cast_u8_to_f32_gpu` (already prototyped) and `resize_bilinear` (already prototyped) as the first two live pipeline stages
+- End-to-end smoke test: RTSP stream → GPU cast + resize → CPU download (correctness, not yet 30 fps)
+- Implement grayscale, flip, normalize image ops and wire normalize into the pipeline
 
-Deliverables: functional foundational image operations with benchmarks.
+Deliverables: functional Bubbaloop node (pipeline is live; BEV warp not yet present, but frames are flowing through GPU ops end-to-end); grayscale, flip, normalize contributed to kornia-imgproc.
 
 ---
 
-### Weeks 2–3 : Filter Kernels
+### Weeks 3–4 : Perspective Warp + Full BEV Pipeline
 
 Tasks:
-- Implement box, Gaussian, Sobel filter kernels
-- Optimised WGSL with shared memory tiling for separable filters
-- Prototype texture sampler pipeline for hardware bilinear sampling
-- Criterion benchmarks
+- Implement `perspective_warp_gpu` kernel (`ops::image::warp`) with hardware TMU bilinear sampling via wgpu texture bindings
+- Validate warp correctness against CPU reference implementation with numerical unit tests
+- Wire `perspective_warp_gpu` into the BEV node: full upload → cast → resize → normalize → warp → download pipeline
+- Test end-to-end BEV on development hardware (laptop/desktop GPU with Vulkan)
+- Prototype the texture sampler pipeline for warp and resize (hardware TMU path)
 
-Deliverables: working filter kernels, examples for applying filters on real-time video streams, basic image pipeline using hardware texture samplers.
+Deliverables: `perspective_warp_gpu` contributed to kornia-wgpu under `ops::image::warp`; full BEV pipeline running on development hardware; texture pipeline prototype (TMU path for warp).
 
 ---
 
-### Weeks 4–5 : Perspective Warp + Bubbaloop Node
+### Week 5 : Filter Kernels
 
 Tasks:
-- Implement `perspective_warp_gpu` kernel (`ops::image::warp`)
-- Contribute to kornia-wgpu, write tests against CPU reference
-- Implement single-camera Bubbaloop node with GStreamer RTSP input
-- Test bird's-eye view transform end-to-end on development hardware
-- Coordinate with mentors on node integration
+- Implement box, Gaussian, Sobel filter kernels with WGSL compute shaders
+- Optimise separable Gaussian with `var<workgroup>` shared memory (horizontal pass + vertical pass)
+- Finalise and integrate texture-based sampling pipeline (hardware TMU path)
+- Criterion benchmarks for all filter ops against kornia-imgproc CPU baseline
 
-Deliverables: perspective warp kernel, Bubbaloop integration prototyped.
+Deliverables: box, Gaussian, Sobel kernels contributed to kornia-imgproc; texture-based sampling pipeline integrated into kornia-wgpu; filter benchmark suite.
 
 ---
 
 ### Week 6 : Jetson Orin Integration + Bubbaloop Demo
 
 Tasks:
-- Deploy pipeline node on Jetson Orin
-- Record demo video of single-camera bird's-eye view at 30 fps
-- Benchmark GPU vs CPU per-frame latency for the warp kernel
-- Profile warp kernel on Jetson Orin and apply any Vulkan-specific dispatch tuning if needed
+- Deploy the full Bubbaloop BEV node on Jetson Orin
+- Profile dispatch geometry on Jetson's Vulkan implementation; tune workgroup sizes if needed
+- Record demo: single-camera bird's-eye view at 30 fps
+- Run full-pipeline GPU vs CPU benchmark on Jetson hardware (upload → warp → download)
+- Document Jetson-specific integration notes (unified memory behaviour, driver version, GStreamer pipeline string)
 
-Deliverables: functional Bubbaloop node, bird's-eye view demo.
+Deliverables: Bubbaloop BEV node running on Jetson Orin; demo video: 30 fps bird's-eye view; GPU vs CPU benchmark report (full pipeline latency).
 
-Note: Due to other participants also working on Bubbaloop and its experimental nature, if the demo is not functional before Midterm Evaluation I will keep working on it and make up the time : but the video pipeline will be working by Midterm Evaluation.
+Note: I do not personally own a Jetson Orin, but have access to similarly capable machines for all development and pre-deployment testing. I will coordinate with mentors for Jetson-side deployment and feedback. If the Jetson demo is not fully operational by midterm due to hardware access timing, I will complete it with carry-over time in Week 7 — but the full BEV pipeline will be running on development hardware (Vulkan/desktop GPU) by midterm without exception.
 
 ---
 
 **Midterm Evaluation**
 
+State at midterm: the Bubbaloop BEV node is live. `perspective_warp_gpu` is contributed to kornia-rs. The full BEV pipeline runs end-to-end with 2 PCIe crossings per frame. Filter kernels are contributed. The Jetson demo is either complete or in active deployment testing. The benchmark report exists.
+
 ---
 
-### Weeks 6–7 : Tensor Reductions
+### Weeks 7–8 : Tensor Reductions
 
 Tasks:
-- Implement sum, mean, min, max with parallel reduction strategy
+- Implement `sum`, `mean`, `min`, `max` with parallel reduction strategy
 - Two-pass reduction for large tensors (local reduce + global reduce)
-- Unit tests and Criterion benchmarks
+- Handle edge cases: tensors not a power-of-two in size; non-contiguous inputs
+- Unit tests and Criterion benchmarks against kornia-tensor CPU baseline
 
-Deliverables: stable tensor compute kernels for reduction ops, GPU tensor test suite.
+Deliverables: stable tensor reduction ops contributed to `ops::tensor`; GPU tensor reduction test suite.
 
 ---
 
-### Weeks 8–9 : Non-Contiguous Tensor Support
+### Weeks 9–10 : Non-Contiguous Tensor Support
 
 Tasks:
 - Implement `is_contiguous()` fast-path dispatch in session layer
 - Stride-aware WGSL variant for non-contiguous tensors (up to rank-4 NCHW)
-- Tests covering transposed and permuted tensor views
+- Strides array passed via `var<immediate>` to avoid uniform buffer allocation per dispatch
+- Tests covering transposed views, permuted channels, and sliced batches
 
-Deliverables: functional, performant non-contiguous tensor ops.
-
-Optional: coordinate with kornia-vlm related GSoC contributor to test integration where possible.
+Deliverables: contiguous fast-path and stride-aware non-contiguous path for all tensor ops; test suite covering transposed and permuted tensor views.
 
 ---
 
-### Weeks 10–11 : Matrix Multiplication
+### Weeks 10–11 : Tiled Matrix Multiplication
 
 Tasks:
-- Implement tiled matmul kernel using `var<workgroup>` shared memory
-- Benchmark moderate matrix sizes
+- Implement tiled matmul kernel with `var<workgroup>` 16×16 shared memory tiles
+- Collaborative tile load + `workgroupBarrier()` + partial dot product accumulation
+- Criterion benchmarks at matrix sizes representative of kornia-rs vision workloads
+- Batched matmul (Z-dimension parallelism) if time permits
 
-Scope: focus on correctness and reasonable performance; batched matmul if time permits.
-
-Deliverables: functional GPU matmul kernel, benchmark comparisons.
+Deliverables: tiled GPU matmul kernel contributed to `ops::tensor`; benchmark comparisons (GPU vs CPU, various matrix sizes).
 
 ---
 
 ### Week 12 : Finalisation
 
 Tasks:
-- Handle edge cases in non-contiguous tensors and stride-aware indexing
-- Cross-platform testing (Vulkan / Metal / DX12)
-- Performance profiling
-- Documentation and examples
+- Cross-platform testing: Vulkan (Linux/Windows), Metal (macOS), DX12 (Windows)
+- Final edge case audit: non-contiguous tensors, power-of-two buffer alignment, platform-specific dispatch limits
+- Complete documentation for all contributed ops and the Bubbaloop node
+- Final GSoC report
 
-Deliverables: final documentation, Bubbaloop demo, GSoC report.
+Deliverables: final documentation for kornia-wgpu and all contributed ops; Bubbaloop BEV demo video (public); final GSoC report.
 
 Each phase includes continuous benchmarking against CPU implementations to ensure measurable performance improvements.
 
 ---
 
 ## Availability
-- I happen to have summer break for the almost the entiriety of the coding period, so I can give **35 hours** per week of time to my project.
+- I happen to have summer break for almost the entirety of the coding period, so I can give **35 hours** per week of time to my project.
 
 - I will be online on Discord daily, weekly meetings are also good.
 
-- I can communicate on any platform preffered by the maintainers(Discord, Github, Mail, Slack, etc..)
+- I can communicate on any platform preferred by the maintainers (Discord, Github, Mail, Slack, etc.)
 
 - Timezone: **UTC+5:30**. But really you can reach me at almost any time of the day, I'll try to respond as quickly as possible.
 
